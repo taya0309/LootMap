@@ -78,6 +78,7 @@ src/           插件源码（单文件主体 + 渲染宿主）
 release/       成品：d2rl-loot-map.dll + loot-map.toml（下载这两个即可）
 tools/         开发期工具：日志分析、STARID 对比、蓝装前缀校准、字节校验等
 third_party/   ImGui（MIT，见 third_party/LICENSE.txt）
+CHANGELOG.md   更新记录（每个版本改了什么）
 ```
 
 ## 已知限制
