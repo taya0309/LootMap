@@ -2,10 +2,8 @@
 build-ninja/
 build/
 *.obj
-*.dll
 
-# 发布与归档
-release/
+# 归档（成品 release/ 保留在仓库里，供直接下载）
 archive/
 
 # 临时文件
