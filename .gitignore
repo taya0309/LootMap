@@ -1,0 +1,15 @@
+# 构建产物
+build-ninja/
+build/
+*.obj
+*.dll
+
+# 发布与归档
+release/
+archive/
+
+# 临时文件
+_*
+*.log
+*.bak*
+*.tmp
