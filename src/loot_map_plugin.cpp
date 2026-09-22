@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.4
+//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.5
 //
 //  目标：让地面上的物品也出现在游戏自带的（小）地图上；同时提供一个游戏内设置面板。
 //
@@ -498,7 +498,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map",
 	.name        = "Loot Map",
-	.version     = "0.18.4",
+	.version     = "0.18.5",
 	.author      = "local build",
 	.description = "Shows set & unique ground items on the native automap as solid stars (green / bright gold).",
 	.flags       = kFlags,
@@ -3400,7 +3400,12 @@ auto Uninstall() noexcept -> void {
 //  · 宿主不在场时退回到游戏原生面板。
 auto ToggleOverlayPanel() noexcept -> bool;   // false = 叠加层面板这次用不了
 auto OverlayPanelReady() noexcept -> bool;
-namespace OverlayPanel { auto IsOpen() noexcept -> bool; auto StateText() noexcept -> const char*; }
+namespace OverlayPanel {
+auto IsOpen() noexcept -> bool;
+auto StateText() noexcept -> const char*;
+// ★ v0.18.5：退回原生面板时把"为什么"一次讲清楚（日志只打一行）。
+auto ExplainFallback() noexcept -> void;
+}
 
 // ────────────── 游戏「控制」菜单里的按键（v0.9.0 新增）──────────────
 //  这是玩家唯一能自己改键的入口。把"打开面板"注册成一条游戏原生动作后：
@@ -3429,6 +3434,10 @@ auto __cdecl OnTogglePanel(const D2RL::PluginContext* /*context*/,
 	// ★ 先试叠加层面板（跟地图插件同一种 ImGui 窗口，好看得多）；
 	//   宿主不在场时才退回游戏原生面板。
 	if (!ToggleOverlayPanel()) {
+		// ★ v0.18.5：把"为什么退回"写进日志 —— 别人用这个插件时最常撞到的
+		//   就是"没装地图插件（MapSense）"，以前这里只有一行 native panel 提示，
+		//   看不出根因。
+		OverlayPanel::ExplainFallback();
 		if (!NativePanel::ToggleFromCommand()) {
 			LogWarn("loot-map: the panel hotkey was pressed but no panel backend is available.");
 		}
@@ -3598,6 +3607,7 @@ auto TogglePanelCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* c
 		return D2RL::ConsoleCommandResult::Handled;
 	}
 	if (NativePanel::ToggleFromCommand()) {
+		OverlayPanel::ExplainFallback();   // ★ v0.18.5：把根因写进日志（只打一次）
 		command->plugin->WriteConsoleMessage("loot-map: native panel toggled (details in logs/loot-map.log).");
 		return D2RL::ConsoleCommandResult::Handled;
 	}
@@ -6805,6 +6815,40 @@ auto StateText() noexcept -> const char* {
 	}
 }
 
+// ★ v0.18.5：面板退回**游戏原生面板**时，把根因一次讲清楚（每次运行只记一行）。
+//
+//   绝大多数情况只有一个原因：**没装地图插件 RuffnecKk MapSense**。
+//   本插件的漂亮面板、以及地图上的星形标记，都是画在 MapSense 那一层 Dear ImGui 里的
+//   （它是往游戏画面上叠层的唯一渲染主人；自己再叠一层会跟它抢 DirectX 12 而崩，
+//     这在 v0.3.x 时代已经实测过一次）。
+//   MapSense 不在场 ⇒ 没有那一层可画 ⇒ 只剩游戏原生面板可用，星标也不会出现；
+//   但"改游戏自己标记的颜色"那部分（取色钩子）照常生效，所以不是完全没效果。
+auto ExplainFallback() noexcept -> void {
+	static bool s_logged = false;
+	if (s_logged) {
+		return;
+	}
+	s_logged = true;
+
+	const HMODULE host = ::GetModuleHandleW(L"d2rl-ruffneckk-mapsense.dll");
+	const bool  hasApi = (host != nullptr) &&
+		(::GetProcAddress(host, "RuffnecKkMapSenseGetOverlayHostApi") != nullptr);
+
+	char line[560] {};
+	std::snprintf(line, sizeof(line),
+		"loot-map: panel fallback -- the legacy NATIVE panel is used this session. "
+		"overlay_state='%s' host_callback_seen=%d mapsense_module=%d overlay_api=%d. "
+		"WHY IT MATTERS: both the ImGui panel and the map stars are drawn inside RuffnecKk "
+		"MapSense's overlay layer, so MapSense (d2rl-ruffneckk-mapsense.dll in "
+		"d2rloader\\plugins) must be installed and loaded; without it only this legacy panel "
+		"and the item COLOURS work (no stars).",
+		StateText(),
+		g_hostSeen.load(std::memory_order_relaxed) ? 1 : 0,
+		(host != nullptr) ? 1 : 0,
+		hasApi ? 1 : 0);
+	LogWarn(line);
+}
+
 }   // namespace OverlayPanel
 
 // 前面 InputActions / 控制台命令用到的两个入口
@@ -6908,6 +6952,7 @@ auto OverlayProbeTick(const D2RL::PluginContext* ctx, void* /*userData*/) noexce
 			}
 			if (n >= kOverlayMaxAttempts) {
 				LogWarn("OVL: gave up joining the MapSense overlay layer after many attempts.");
+				OverlayPanel::ExplainFallback();   // ★ v0.18.5：顺带把"缺 MapSense"这个根因写清楚
 				g_ovlState.store(2, std::memory_order_relaxed);
 			}
 		}
@@ -6951,7 +6996,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 	g_context = context;
 
-	context->LogInfo("Loot Map 0.18.4 loading ... (star size default 16; X/Y offset sliders are back in the Stars section so the star can be aligned onto the item once and saved)");
+	context->LogInfo("Loot Map 0.18.5 loading ... (needs RuffnecKk MapSense: the ImGui panel and the map stars are drawn inside its overlay layer; without it the plugin falls back to the legacy native panel and logs exactly why)");
 
 	// 1) 读配置
 	(void)context->EnsureConfig();
