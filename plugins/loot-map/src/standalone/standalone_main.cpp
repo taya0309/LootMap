@@ -86,8 +86,8 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map-standalone",
 	.name        = "Loot Map (standalone overlay)",
-	.version     = "0.3.1",
-	.author      = "local build",
+	.version     = "0.3.2",
+	.author      = "taya",
 	.description = "Standalone build for machines WITHOUT RuffnecKk MapSense: it IS the overlay layer (implements the MapSense overlay host API), so the main plugin draws its panel and map stars here unchanged.",
 	.flags       = kFlags,
 };
@@ -698,7 +698,7 @@ auto DrawNoClientBoard() noexcept -> void {
 	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(14, 20, 28, 210), 10.0f);
 	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(96, 200, 255, 220), 10.0f, 0, 2.0f);
 	dl->AddText(ImVec2(x + 18.0f, y + 14.0f), IM_COL32(232, 238, 246, 255),
-		"Loot Map 独立叠加层 v0.3.1 已就绪（不需要 MapSense）");
+		"Loot Map 独立叠加层 v0.3.2 已就绪（不需要 MapSense）");
 	dl->AddText(ImVec2(x + 18.0f, y + 44.0f), IM_COL32(160, 200, 255, 255),
 		"暂时没有插件在画：装上 d2rl-loot-map.dll 后，F7 面板与地图星标会出现在这一层");
 	if (g_gfx.font != nullptr) {
@@ -1267,7 +1267,7 @@ auto Install(const D2RL::PluginContext* context) noexcept -> void {
 		LogWarn("standalone: ThreadService unavailable (the self-owned worker is the only path).");
 	}
 
-	LogInfo("standalone: v0.3.1 running -- this build IS the overlay layer (it implements the "
+	LogInfo("standalone: v0.3.2 running -- this build IS the overlay layer (it implements the "
 	        "MapSense overlay host API). The main plugin draws its panel and map stars here; "
 	        "nothing needs to be changed in the main plugin.");
 }
@@ -1334,7 +1334,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		return false;
 	}
 	g_context = context;
-	context->LogInfo("Loot Map standalone 0.3.1 loading ... (self-contained OVERLAY HOST for "
+	context->LogInfo("Loot Map standalone 0.3.2 loading ... (self-contained OVERLAY HOST for "
 	                 "machines WITHOUT MapSense: it publishes the MapSense overlay host API, so "
 	                 "the unmodified main plugin draws its panel and map stars inside this layer)");
 	Install(context);

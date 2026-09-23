@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.8
+//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.9
 //
 //  目标：让地面上的物品也出现在游戏自带的（小）地图上；同时提供一个游戏内设置面板。
 //
@@ -498,8 +498,8 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map",
 	.name        = "Loot Map",
-	.version     = "0.18.8",
-	.author      = "local build",
+	.version     = "0.18.9",
+	.author      = "taya",
 	.description = "Shows set & unique ground items on the native automap as solid stars (green / bright gold).",
 	.flags       = kFlags,
 };
@@ -7036,7 +7036,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 	g_context = context;
 
-	context->LogInfo("Loot Map 0.18.8 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
+	context->LogInfo("Loot Map 0.18.9 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
 
 	// 1) 读配置
 	(void)context->EnsureConfig();
