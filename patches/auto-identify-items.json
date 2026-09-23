@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "自动鉴定物品（掉落即已鉴定） Auto-Identify Items",
+  "description": "让魔法/稀有物品在生成时就处于已鉴定状态：抹掉物品生成流程里那两处「清除已鉴定标记」的调用。地图/背包里的物品不再需要鉴定卷轴。与官方 D2RL-Plugins 的 magicItemsSpawnIdentified / rareItemsSpawnIdentified 同效。",
+  "patches": [
+    {
+      "description": "魔法物品生成时不再清除 IFLAG_IDENTIFIED",
+      "op": "nop",
+      "rva": "0x442D2A",
+      "size": 5,
+      "expected": "E8 C1 AB F2 FF"
+    },
+    {
+      "description": "稀有物品生成时不再清除 IFLAG_IDENTIFIED",
+      "op": "nop",
+      "rva": "0x58BE1A",
+      "size": 5,
+      "expected": "E8 D1 1A DE FF"
+    }
+  ]
+}
