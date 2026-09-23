@@ -120,3 +120,61 @@ add_custom_command(TARGET LootMapPlugin POST_BUILD
             "$<TARGET_FILE:LootMapPlugin>" "${LOOTMAP_STAGE_DIR}/"
     COMMENT "Loot Map：输出已复制到 ${LOOTMAP_STAGE_DIR}"
 )
+
+# ---------------------------------------------------------------------------
+# 独立叠加层版（**不依赖 MapSense**）—— d2rl-loot-map-standalone.dll
+#
+#   与主插件完全独立：主插件照旧借 MapSense 的叠加层；这一版自己叠一层，
+#   给"没装 MapSense"的机器用。两者是**两个 DLL**，互不影响。
+#   做法照抄 MapSense 的路子（MIT）：MinHook 钩函数（不改虚表）+
+#   钩 IDXGIFactory 的 CreateSwapChain 系列拿"队列+交换链"配对 + 在 Present 里同步画。
+#   当前进度：v0.3.0 —— 它**自己就是叠加层宿主**（实现 MapSense 导出的宿主接口，
+#   见 src/standalone/host_api.cpp），主插件一个字不用改就会把面板与星标画进来。
+# ---------------------------------------------------------------------------
+enable_language(C)          # MinHook 是 C 源码
+
+set(MINHOOK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook")
+add_library(minhook STATIC
+    "${MINHOOK_DIR}/src/buffer.c"
+    "${MINHOOK_DIR}/src/hook.c"
+    "${MINHOOK_DIR}/src/trampoline.c"
+    "${MINHOOK_DIR}/src/hde/hde64.c"
+)
+target_include_directories(minhook PUBLIC "${MINHOOK_DIR}/include")
+target_include_directories(minhook PRIVATE "${MINHOOK_DIR}/src" "${MINHOOK_DIR}/src/hde")
+set_target_properties(minhook PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+if(MSVC)
+    target_compile_options(minhook PRIVATE /W3)
+endif()
+
+add_library(LootMapStandalone SHARED
+    src/standalone/standalone_main.cpp
+    src/standalone/host_api.cpp
+    src/standalone/standalone.rc
+)
+target_link_libraries(LootMapStandalone PRIVATE D2RLPlugin::D2RLPlugin minhook imgui d3d12 dxgi delayimp)
+if(MSVC)
+    target_compile_options(LootMapStandalone PRIVATE /utf-8 /W4 /permissive-)
+    # 和主插件一样：图形 DLL 延迟加载，插件被 LoadLibrary 时只依赖 KERNEL32/USER32。
+    target_link_options(LootMapStandalone PRIVATE
+        /DELAYLOAD:dxgi.dll
+        /DELAYLOAD:d3d12.dll
+        /DELAYLOAD:D3DCOMPILER_47.dll
+        /DELAYLOAD:IMM32.dll
+        /DELAYLOAD:SHELL32.dll
+    )
+endif()
+set_target_properties(LootMapStandalone PROPERTIES
+    OUTPUT_NAME "d2rl-loot-map-standalone"
+    PREFIX ""
+    SUFFIX ".dll"
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+add_custom_command(TARGET LootMapStandalone POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${LOOTMAP_STAGE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:LootMapStandalone>" "${LOOTMAP_STAGE_DIR}/"
+    COMMENT "Loot Map standalone：输出已复制到 ${LOOTMAP_STAGE_DIR}"
+)

@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.5
+//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.8
 //
 //  目标：让地面上的物品也出现在游戏自带的（小）地图上；同时提供一个游戏内设置面板。
 //
@@ -498,7 +498,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map",
 	.name        = "Loot Map",
-	.version     = "0.18.5",
+	.version     = "0.18.8",
 	.author      = "local build",
 	.description = "Shows set & unique ground items on the native automap as solid stars (green / bright gold).",
 	.flags       = kFlags,
@@ -810,6 +810,14 @@ std::atomic<int> g_skipSiteB { 0 };   // 调用点 C：物品标记函数直连�
 std::atomic<std::uint32_t> g_siteAHits    { 0 };   // A 点钩子实际命中（星品）
 std::atomic<std::uint32_t> g_siteCHits    { 0 };   // C 点钩子被调（任何单位）
 std::atomic<std::uint32_t> g_shapeHits    { 0 };   // 形状绘制闸门实际拦下的次数（灰块）
+
+// ★ v0.18.7 诊断：三个被改写的调用点**分别被叫到多少次**（不管闸门有没有拉）。
+//   配合 g_hiddenItems（我们叫引擎"这一件不要画"的次数）就能回答那个矛盾：
+//   "我们明明叫它别画，它却还在画" —— 到底是哪一环没生效（或者根本不是这条管线画的）。
+std::atomic<std::uint32_t> g_siteATotal   { 0 };   // A 点被调总次数
+std::atomic<std::uint32_t> g_shapeTotal   { 0 };   // S1..S5 形状点被调总次数
+std::atomic<std::uint32_t> g_hiddenItems  { 0 };   // 我们判定"不画"的物品取色次数
+std::atomic<std::uint32_t> g_siteASkipped  { 0 };   // A 点被我们拦掉的总笔数（星品 + 隐藏品）
 
 auto SetSkipGates(bool on) noexcept -> void {
 	const int v = on ? 1 : 0;
@@ -2037,6 +2045,7 @@ std::atomic<bool> g_blobIconHookInstalled { false };
 //   C 点钩子保留作后备；pending 是单令牌，谁先抢到谁记，不会画双星。
 //   第 4 个 float 形参 = xmm3 = 引擎传给 sub_858510 的"缩放"（寄存器原样保留）。
 auto __fastcall HookBlobIconPrep(void* obj, const void* point, void* style, float zoom) noexcept -> int {
+	g_siteATotal.fetch_add(1, std::memory_order_relaxed);   // ★ v0.18.7 诊断：A 点被叫总次数
 	RememberRenderCtx(obj, zoom);   // ★ v0.12.8：给雷达倍率留一份"当帧 ctx + 缩放"
 	const int starSlot = g_starSlotPending.exchange(0, std::memory_order_relaxed) - 1;
 	const int starConf = g_starConfPending.exchange(0, std::memory_order_relaxed);   // ★ v0.14.1
@@ -2053,12 +2062,14 @@ auto __fastcall HookBlobIconPrep(void* obj, const void* point, void* style, floa
 			//   B 点/形状闸门（灰底块）保留：那一笔在后面才画，还要靠它们拦。
 			(void)g_skipSiteA.exchange(0, std::memory_order_relaxed);
 			g_pendingRgb.active = false;   // 作废待用色，防止串到别的单位身上
+			g_siteASkipped.fetch_add(1, std::memory_order_relaxed);
 			return 1;                      // 就地返回，引擎这一笔不画
 		}
 	}
 
 	if (g_skipSiteA.exchange(0, std::memory_order_relaxed) != 0) {   // ★ v0.14.9：回退成一次性（v0.14.8 的常开会压掉别人共用的绘制口）
 		g_pendingRgb.active = false;   // 作废待用色，防止串到别的单位身上
+		g_siteASkipped.fetch_add(1, std::memory_order_relaxed);
 		return 1;                      // 就地返回，引擎这一笔不画
 	}
 
@@ -2109,6 +2120,7 @@ auto __fastcall HookBlobShapeBase(void* obj, const void* point, void* /*style*/,
 // 星品时 g_skipSiteB 拉闸 → 就地返回，"额外图形"不画；非星品照常进原函数。
 // 参数不认识也不需要认识 —— 小桩会原样保存/还原所有易失寄存器。
 auto __fastcall HookShapeDrawer(void*, const void*, void*, float) noexcept -> int {
+	g_shapeTotal.fetch_add(1, std::memory_order_relaxed);   // ★ v0.18.7 诊断：形状点被叫总次数
 	if (g_skipSiteB.exchange(0, std::memory_order_relaxed) != 0) {   // ★ v0.14.9：同上，回退成一次性
 		g_shapeHits.fetch_add(1, std::memory_order_relaxed);
 		g_pendingRgb.active = false;
@@ -2130,18 +2142,23 @@ auto __fastcall HookShapeDrawer(void*, const void*, void*, float) noexcept -> in
 //  ★ 为什么必须保存那一堆寄存器：我们是"透明地"插在中间 —— 原函数
 //    sub_858510 的三个参数就在 rcx / rdx / r8 里。我们的 C++ 函数（编译器
 //    自动生成）会随手用这些寄存器当草稿纸，若不还原，原函数就会收到一堆
-//    垃圾参数。所以所有"易失"寄存器（rax, rcx, rdx, r8~r11, xmm0~xmm5）
+//    垃圾参数。所以除 rax 之外的易失寄存器（rcx, rdx, r8~r11, xmm0~xmm5）
 //    都在调用我们的函数前存好、回来后原样复原。
+//    rax 是**故意不存的**：它是钩子函数的返回值（见下面 v0.18.6 那条）。
 //
 //  栈帧布局（刚进小桩时 rsp % 16 == 8，因为 call 压了一个返回地址）：
 //      sub rsp, 0xC8        -> rsp % 16 == 0
 //      [rsp+0x00 .. 0x1F]   被调函数的"影子空间"，32 字节，我们不能占用
-//      [rsp+0x20 .. 0x50]   7 个通用寄存器
+//      [rsp+0x28 .. 0x50]   6 个通用寄存器（rcx/rdx/r8~r11；0x20 空着不用）
 //      [rsp+0x60 .. 0xB0]   6 个 xmm 寄存器（偏移都是 16 的倍数，movaps 才合法）
-// v0.12.3：小桩尾部加了 5 字节分支 —— 我们的钩子返回 1（"这是画星的物品"）时
+// v0.12.3：小桩尾部加了 4 字节分支 —— 我们的钩子返回 1（"这是画星的物品"）时
 // 就地 ret 回 DrawBlob，**根本不进引擎的绘制函数**（X 彻底消失，地图上只剩星）；
-// 返回 0 才尾跳进原函数。ret 时 DrawBlob 只会看到 rax=返回值，而它本来就不检查。
-constexpr std::size_t   kBlobStubSize  = 251;
+// 返回 0 才尾跳进原函数。
+// ★ v0.18.6：**判定必须看钩子的返回值**——rax 不恢复，AL 一路留着返回值到最后
+//   （见 kStubGpSlots 上面的长注释）。rax 不再进出保存区 ⇒ 251 → 235 字节。
+//   这个数字必须和 BuildBlobIconStub 实际发射的字节数**逐字节**相等，
+//   否则函数直接返回失败（宁可不补丁，也不要有半截机器码在游戏里跑）。
+constexpr std::size_t   kBlobStubSize  = 235;
 constexpr std::uint32_t kBlobStubFrame = 0xC8;
 constexpr std::uint32_t kBlobStubXmmLo = 0x60;   // 第 0 个 xmm 的偏移
 
@@ -2151,8 +2168,18 @@ struct StubRegSlot {
 };
 // 只保存绘制函数真正可能用到的易失寄存器（rdi/rsi/rbx/rbp 是"非易失"，
 // 我们的 C++ 函数自己会保护，不用管；rsp 靠 add 还原）
+//
+// ★★★ v0.18.6 修正（很重要，别改回去）：**这里绝对不能保存/恢复 rax。**
+//   小桩尾部用 `test al,al` 判断"我们的钩子函数有没有要求跳过这一笔"——
+//   而 rax 就是钩子返回值所在。以前 kStubGpSlots 里带着 rax，那一句恢复
+//   会把返回值覆盖成"调用点当时的旧 rax"：于是"跳不跳"跟钩子彻底无关，
+//   变成由调用点决定的固定值 —— 结果引擎所有走这批调用点的绘制
+//   （NPC 名字、门/箱子/传送点的白色十字标记…）被成片吃掉。
+//   症状：装上插件后地图上少了这些标记；因为 MapSense 自己也画标记，
+//   以前一直没被发现（拆掉 MapSense 才露出来）。
+//   rax 本来就是**易失**寄存器、原函数也不靠它收参数 ⇒ 不恢复它才是正确做法。
 constexpr StubRegSlot kStubGpSlots[] {
-	{  0, 0x20 }, {  1, 0x28 }, {  2, 0x30 }, {  8, 0x38 },
+	{  1, 0x28 }, {  2, 0x30 }, {  8, 0x38 },
 	{  9, 0x40 }, { 10, 0x48 }, { 11, 0x50 },
 };
 
@@ -2455,15 +2482,19 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 			if (sig != s_lastSig.load(std::memory_order_relaxed) || now - last >= 30000) {
 				s_lastTick.store(now, std::memory_order_relaxed);
 				s_lastSig.store(sig, std::memory_order_relaxed);
-				char dline[260] {};
+				char dline[400] {};
 				std::snprintf(dline, sizeof(dline),
-					"diag: item=%u blobStub=%u siteA=%u siteC=%u shapeSkips=%u starsDrawn=%u "
-					"overwrites=%u engSet=%d engUniq=%d rescued=%u rule0=%u",
+					"diag: item=%u hidden=%u blobStub=%u siteA=%u/%u skipA=%u siteC=%u shape=%u/%u "
+					"starsDrawn=%u overwrites=%u engSet=%d engUniq=%d rescued=%u rule0=%u",
 					static_cast<unsigned>(g_itemCalls),
+					static_cast<unsigned>(g_hiddenItems.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_blobStubCalls.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_siteAHits.load(std::memory_order_relaxed)),
+					static_cast<unsigned>(g_siteATotal.load(std::memory_order_relaxed)),
+					static_cast<unsigned>(g_siteASkipped.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_siteCHits.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_shapeHits.load(std::memory_order_relaxed)),
+					static_cast<unsigned>(g_shapeTotal.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_starSamples.load(std::memory_order_relaxed)),
 					static_cast<unsigned>(g_pendingOverwrites.load(std::memory_order_relaxed)),
 					g_engineSetColor.load(std::memory_order_relaxed),
@@ -2655,22 +2686,31 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 				SetSkipGates(true);
 			}
 		}
+		// ★ v0.18.8：**关掉的类别 = 引擎一个字都不许画**，走**和星品完全一样的路**：
+		//   拉闸门 → 引擎照常来画 → 小桩在绘制口就地返回（整笔含名字都不画）。
+		//
+		//   为什么不再用前两版那两招（实测都不行）：
+		//     · out2 = -1：只挡住"光点"那一笔，挡不住引擎自己画的标记（用户看到满地 X）；
+		//     · out1 = "跳过色号"：**根本没有"跳过的色号"这回事** —— 写 1 之后引擎
+		//       把它当颜色用，于是所有这类物品的标记变成了**绿色的 X**（v0.18.7 的锅）。
+		//   闸门这条路是验证过的：星品 8407:8407:8407 一一对应，说明"取色 → 紧接着那一笔
+		//   绘制"是同一个单位、顺序紧挨着，所以闸门必定被它自己那一笔消费，不会误吃别人。
+		const bool hideEngine = (starSlot < 0) && g_settings.hideEngineShape;
 		int index = g_settings.color[slotIdx];
 		if (index == kColorSkip1 || index == kColorSkip2 || index < kColorMin || index > kColorMax) {
-			index = kColorMin;   // 调用方会跳过 1 和 4；给个一定能画的值兜底
+			index = kColorMin;   // 给个一定能画的值兜底
+		}
+		if (hideEngine) {
+			SetSkipGates(true);
+			g_hiddenItems.fetch_add(1, std::memory_order_relaxed);
 		}
 		*out1 = index;
 		// out2 = 额外图形选择器：-1 = 不画；0~5 = 游戏自带的 6 种标记图形。
 		// ★ v0.12.6 注意：这里**不能**对星品写 -1！DrawBlob 入口 cmp edx,-1 会
-		//   整个直接返回 → A 点不执行 → 星坐标断供（星直接消失）。out2 必须保持
-		//   非 -1 让 DrawBlob 走完；"额外图形/灰底块"由 F1 里跳转表形状分支画，
-		//   那条路我们用形状绘制调用点的跳过闸门拦（见 kBlobPatchSites 注释）。
-		//   ★ v0.14.9：反过来，**不画星的物品就写 -1** —— 引擎对它整笔都不画，
-		//   从根上消灭"没勾的品质露出小绿星 + 灰底块"（不再依赖闸门时序）。
-		//   这些物品我们不需要坐标，所以 A 点不执行也无所谓。
-		*out2 = (starSlot >= 0 || !g_settings.hideEngineShape)
-			        ? g_settings.shape[slotIdx]
-			        : -1;
+		//   整个直接返回 → A 点不执行 → 星坐标断供（星直接消失）。
+		// ★ v0.18.8：隐藏品也**不能**写 -1 —— 写了它的绘制就不来了，闸门没人消费，
+		//   反过来会去误吃下一笔（别人的标记）。让引擎照常走完，交给小桩拦截。
+		*out2 = g_settings.shape[slotIdx];
 
 		// ★ 任意颜色：如果这一档配了 rgb_xxx，就把颜色交给光点绘制钩子，
 		//   由它改写游戏样式结构里的 r/g/b（见 HookBlobIconPrep 的说明）。
@@ -6996,7 +7036,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 	g_context = context;
 
-	context->LogInfo("Loot Map 0.18.5 loading ... (needs RuffnecKk MapSense: the ImGui panel and the map stars are drawn inside its overlay layer; without it the plugin falls back to the legacy native panel and logs exactly why)");
+	context->LogInfo("Loot Map 0.18.8 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
 
 	// 1) 读配置
 	(void)context->EnsureConfig();

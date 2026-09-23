@@ -1,0 +1,8 @@
+#include <D2RLPlugin/resource.h>
+#include <D2RLPlugin/version.h>
+
+// D2RLoader 需要的插件清单资源（缺了它插件不会被加载）。
+// 与主插件一致：声明 ABI 3（现役 1.2.1-beta 上正常工作的插件都是 2/3）。
+#define LOOT_MAP_STANDALONE_DECLARED_ABI_VERSION 3
+
+D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { D2RL_PLUGIN_RESOURCE_DWORD(LOOT_MAP_STANDALONE_DECLARED_ABI_VERSION) }
