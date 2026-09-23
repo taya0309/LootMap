@@ -42,7 +42,6 @@ plugins/
   loot-map/            掉落物地图标记
     src/               源码（主插件 + 独立叠加层）
     release/           成品（朋友直接下载这个文件夹里的 dll 即可）
-    tools/             开发期工具（字节校验、反汇编、前缀校准等）
     third_party/       第三方库（ImGui、MinHook，各自带许可证）
     README.md          使用说明 + 文件说明
     CHANGELOG.md       更新记录（每个版本改了什么）

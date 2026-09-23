@@ -1729,7 +1729,7 @@ auto DumpUnitRaw(const void* unit, const void* itemData) noexcept -> void {
 //     6 件「珠宝匠」/「工匠」（钩斧/骸骨魔杖/锁链甲/步战矛/连枷等）= **1209 / 1210**；
 //     普通前缀（严冬之）= 1046；「工匠之良质」那件前缀 ID = **0**（它的名字来自别的字段）
 //     ⇒ 用数值 ID 判定，天然不会把「工匠之」误认成「工匠」。
-//   ⚠️ 这两个值来自当前游戏数据（D2R 3.2 + 当时实测所用的模组环境）；mod 大更新后如失灵，
+//   ⚠️ 这两个值来自实测当时的游戏数据；模组大更新后可能变化，如失灵，
 //      重跑一次样本对比即可更新。
 constexpr std::uint16_t kAffixJewelers = 1209;   // 「珠宝匠」（4 孔）
 constexpr std::uint16_t kAffixArtisans = 1210;   // 「工匠」（4 孔）
