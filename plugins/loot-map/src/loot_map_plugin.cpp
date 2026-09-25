@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.9
+//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.10
 //
 //  目标：让地面上的物品也出现在游戏自带的（小）地图上；同时提供一个游戏内设置面板。
 //
@@ -498,7 +498,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map",
 	.name        = "Loot Map",
-	.version     = "0.18.9",
+	.version     = "0.18.10",
 	.author      = "taya",
 	.description = "Shows set & unique ground items on the native automap as solid stars (green / bright gold).",
 	.flags       = kFlags,
@@ -1157,7 +1157,11 @@ struct StarIdSeen {
 	std::uint32_t key    = 0;   // (slot<<24) | txtFileNo
 	std::uint64_t nextMs = 0;   // 下次允许写日志的时刻
 };
-constexpr int kStarIdSlots = 16;
+// ★ v0.18.10：16 → 256。实测（2026-09-25 11:38 大爆装）地上星品远超 16 件时，
+//   键互相挤占、3 秒限流完全失效 —— 每次取色都写一条 1.2KB 的 STARID 日志，
+//   一秒 500 条，loot-map.log 涨到 43MB，帧率 40 → 16。256 格够覆盖整屏星品，
+//   挤占就基本不会发生；下面取色钩子里还加了一道"全局 500ms 一条"的兜底闸。
+constexpr int kStarIdSlots = 256;
 StarIdSeen    g_starIdSeen[kStarIdSlots] {};
 
 // ─────────────────────── 小工具：日志 ───────────────────────
@@ -2659,21 +2663,30 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 				}
 			}
 			if (idx >= 0 && nowIdMs >= g_starIdSeen[idx].nextMs) {
-				g_starIdSeen[idx].nextMs = nowIdMs + 3000;
-				// ★ v0.15.3：取证从 16 字节加长到 **128 字节**（dataPtr+0x00..0x7F）。
-				//   目的：找"蓝装前缀"的判据 —— 用户仓库里有现成的 [珠宝匠]/[工匠] 蓝装，
-				//   把它们和普通蓝装一起丢到地上，对比 STARID 行就能圈出是哪几个字节
-				//   在区分前缀（词缀 ID / 孔数），然后 rule0 就用那几个字节做判定。
-				char db[3 * 128 + 1] {};
-				HexDump(static_cast<const std::uint8_t*>(dataPtr), 128, db, sizeof(db));
-				char sid[1200] {};
-				std::snprintf(sid, sizeof(sid),
-					"STARID slot=%d conf=%d q=%d mode=%u id=%u engOut1=%d txt=%u pfx=%u unit=%p data=%p data[0..128]=%s",
-					starSlot, starConf, quality, static_cast<unsigned>(mode),
-					static_cast<unsigned>(id), static_cast<int>(engineOut1),
-					static_cast<unsigned>(typeNo),
-					static_cast<unsigned>(ReadMagicPrefixId(dataPtr)), unit, dataPtr, db);
-				LogInfo(sid);
+				// ★ v0.18.10：全局兜底限流 —— 上面的 3 秒表再大也可能被挤占
+				//   （键 > 格子数时），这里保证**无论何时，STARID 全局最多每
+				//   500ms 写一条**（≤2 行/秒）。它是纯诊断，最坏慢一点无所谓；
+				   //   没这道闸之前它在大爆装时一秒写过 500 条（掉帧元凶）。
+				static std::atomic<std::uint64_t> s_starIdNextAllowedMs { 0 };
+				std::uint64_t allowMs = s_starIdNextAllowedMs.load(std::memory_order_relaxed);
+				if (nowIdMs >= allowMs
+				    && s_starIdNextAllowedMs.compare_exchange_strong(allowMs, nowIdMs + 500)) {
+					g_starIdSeen[idx].nextMs = nowIdMs + 3000;
+					// ★ v0.15.3：取证从 16 字节加长到 **128 字节**（dataPtr+0x00..0x7F）。
+					//   目的：找"蓝装前缀"的判据 —— 用户仓库里有现成的 [珠宝匠]/[工匠] 蓝装，
+					//   把它们和普通蓝装一起丢到地上，对比 STARID 行就能圈出是哪几个字节
+					//   在区分前缀（词缀 ID / 孔数），然后 rule0 就用那几个字节做判定。
+					char db[3 * 128 + 1] {};
+					HexDump(static_cast<const std::uint8_t*>(dataPtr), 128, db, sizeof(db));
+					char sid[1200] {};
+					std::snprintf(sid, sizeof(sid),
+						"STARID slot=%d conf=%d q=%d mode=%u id=%u engOut1=%d txt=%u pfx=%u unit=%p data=%p data[0..128]=%s",
+						starSlot, starConf, quality, static_cast<unsigned>(mode),
+						static_cast<unsigned>(id), static_cast<int>(engineOut1),
+						static_cast<unsigned>(typeNo),
+						static_cast<unsigned>(ReadMagicPrefixId(dataPtr)), unit, dataPtr, db);
+					LogInfo(sid);
+				}
 			}
 		}
 		// ★ v0.12.0：套装/暗金 → 让绘制钩子顺手把标记坐标记下来给星标用。
@@ -7036,7 +7049,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 	g_context = context;
 
-	context->LogInfo("Loot Map 0.18.9 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
+	context->LogInfo("Loot Map 0.18.10 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
 
 	// 1) 读配置
 	(void)context->EnsureConfig();
