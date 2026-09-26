@@ -1,0 +1,5 @@
+#include <D2RLPlugin/resource.h>
+
+// Plugin ABI manifest. Must match kPluginAbiVersion in
+// stash_right_click_to_cube.cpp (ABI 3 = accepted by the 1.2.1-beta loader).
+D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { 3L }

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>仓库右键入魔盒 - 使用说明</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; background:#f5f6f8; color:#2b2f36; margin:0; padding:32px 16px; }
+  .card { max-width:760px; margin:0 auto; background:#fff; border-radius:12px; padding:36px 44px; box-shadow:0 2px 12px rgba(0,0,0,.08); }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:#7a8290; font-size:13px; margin-bottom:24px; }
+  h2 { font-size:17px; margin:28px 0 10px; border-left:4px solid #4a7dff; padding-left:10px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; margin:8px 0; }
+  th,td { border:1px solid #e2e5ea; padding:8px 12px; text-align:left; }
+  th { background:#f2f5fa; }
+  .key { display:inline-block; background:#2b2f36; color:#fff; border-radius:5px; padding:2px 10px; font-size:13px; margin:0 2px; }
+  .ok { color:#1a9e55; font-weight:600; }
+  .warn { color:#d07a00; font-weight:600; }
+  code { background:#f0f2f5; border-radius:4px; padding:1px 6px; font-size:13px; }
+  li { margin:6px 0; line-height:1.7; }
+  p { line-height:1.7; font-size:14px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>仓库右键入魔盒</h1>
+  <div class="sub">D2RLoader 插件 · v3.1.0 · 作者 TAYA · 适用于 D2RLoader 1.2.1-beta</div>
+
+  <h2>一句话用法</h2>
+  <p>鼠标<b>悬停</b>在物品上，按 <span class="key">Ctrl</span> + <span class="key">右键</span>，物品直接飞进赫拉迪克魔盒。不需要打开魔盒，也不会误喝药水、误用卷轴（右键已被插件拦截）。</p>
+
+  <h2>支持范围</h2>
+  <table>
+    <tr><th>物品位置</th><th>效果</th><th>前提</th></tr>
+    <tr><td>背包</td><td class="ok">直达魔盒（瞬时）</td><td>无</td></tr>
+    <tr><td>个人仓库</td><td class="ok">直达魔盒（瞬时）</td><td>无</td></tr>
+    <tr><td>共享仓库</td><td class="warn">经背包中转（约半秒）</td><td>共享仓库和背包同时打开，且背包有至少一个空位</td></tr>
+  </table>
+  <p style="color:#7a8290;font-size:13px;">※ 共享仓库需中转是游戏面板规则（魔盒与仓库不能同时打开）和 1.2.1 启动器功能限制所致，并非插件缺陷。升级新版启动器后自动改善。</p>
+
+  <h2>使用方法</h2>
+  <ol>
+    <li>启动游戏（插件随 D2RLoader 自动加载，无需手动开启）。</li>
+    <li>进入游戏，打开背包或仓库。</li>
+    <li>鼠标悬停在要移动的物品上（等物品提示框出现）。</li>
+    <li>按住 <span class="key">Ctrl</span> 不放，点一下 <span class="key">右键</span> → 物品进入魔盒。</li>
+    <li>可以连续快速操作多个物品。</li>
+  </ol>
+
+  <h2>注意事项</h2>
+  <ul>
+    <li>魔盒空间不足时，物品<b>原地不动</b>，不会丢失。</li>
+    <li>共享仓库中转失败时（多为背包已满），物品留在原位，把日志里的提示看一眼即可。</li>
+    <li>只在游戏窗口前台响应，切到其他窗口按 Ctrl+右键不会有任何效果。</li>
+    <li>手柄玩家的 A 键激活同样会触发移动。</li>
+  </ul>
+
+  <h2>文件与日志</h2>
+  <table>
+    <tr><th>项目</th><th>位置</th></tr>
+    <tr><td>插件本体</td><td><code>游戏目录\d2rloader\plugins\d2rl-stash-rightclick-cube.dll</code></td></tr>
+    <tr><td>卸载方法</td><td>删除上面这个 DLL 即可（游戏关闭时操作）</td></tr>
+    <tr><td>运行日志</td><td><code>游戏目录\d2rloader\logs\stash-rightclick-cube.log</code></td></tr>
+    <tr><td>存档安全</td><td>移动为原子操作，失败自动原地恢复；D2RLoader 自带存档备份</td></tr>
+  </table>
+</div>
+</body>
+</html>

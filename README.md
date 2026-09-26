@@ -11,6 +11,7 @@
 | 插件 | 一句话说明 | 链接 |
 |---|---|---|
 | **[loot-map](plugins/loot-map/README.md)** | 掉落物地图标记：暗金/套装在地图上显示为星；**不依赖 MapSense**（内置独立叠加层），F7 全中文面板 | [成品下载](plugins/loot-map/release/) · [使用说明](plugins/loot-map/README.md) · [更新记录](plugins/loot-map/CHANGELOG.md) |
+| **[stash-rightclick-cube](plugins/stash-rightclick-cube/使用说明.txt)** | 仓库/背包物品悬停按 **Ctrl+右键**，直接进魔盒：不用拖来拖去，也不会手滑喝掉药水 | [成品下载](plugins/stash-rightclick-cube/release/) · [使用说明](plugins/stash-rightclick-cube/使用说明.txt) |
 
 ## 通用安装方法
 
