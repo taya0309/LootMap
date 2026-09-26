@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.10
+//  Loot Map —— 掉落物地图标记插件（D2RLoader 插件）v0.18.21
 //
 //  目标：让地面上的物品也出现在游戏自带的（小）地图上；同时提供一个游戏内设置面板。
 //
@@ -479,6 +479,7 @@
 #include <unordered_set>
 
 #include <windows.h>
+#include <intrin.h>          // ★ v0.18.13：__rdtsc（性能剖面用）
 #include <d3d12.h>
 
 namespace {
@@ -498,7 +499,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = kPluginAbiVersion,
 	.id          = "loot-map",
 	.name        = "Loot Map",
-	.version     = "0.18.10",
+	.version     = "0.18.21",
 	.author      = "taya",
 	.description = "Shows set & unique ground items on the native automap as solid stars (green / bright gold).",
 	.flags       = kFlags,
@@ -737,6 +738,32 @@ struct Settings {
 	//   false 就能立刻回到"宿主合并字体"（可读、混排），不用重装旧版。
 	bool  ownFont = true;
 
+	// ★★ v0.18.16：**日志体积**的两个开关（用户反馈 loot-map.log 越来越大）。
+	//
+	//   实测（2026-09-25 那次会话，日志 2.93 MB / 7,610 行）各类型的字节占比：
+	//       STARID      68.4%   ← 每行约 550 字节（HexDump 128 字节）
+	//       Overlay     10.8%   ← 每 10 秒一条
+	//       prof:        8.7%   ← 每 5 秒一条
+	//       diag:        7.3%   ← 每 5 秒一条
+	//     其余（启动探针等）合计 <5%。
+	//   而 D2RLoader **没有**日志大小上限/轮转（那些 loot-map.log.prev* 是部署脚本手工转的），
+	//   所以文件只会一直涨 ⇒ 只能靠"少写"。
+	//
+	//   evidence：STARID 取证（当初为逆向「蓝装前缀是哪几个字节」加的）。
+	//     使命已完成，**默认关**。关掉同时省下每件星品每次取色的 256~768 次线性查找。
+	//     要再查证据时把它改成 true（面板上没有这个控件，只能改 toml + lootmap-reload）。
+	bool  evidence = false;
+	//   diagSec：周期性诊断（diag: / prof: / Overlay stars）的间隔秒数。
+	//     原来硬编码 5/5/10 秒。默认放宽到 600 秒 ⇒ 日志体积再降一个数量级。
+	//     调性能/排查时改成 5，日常玩就留 600（钳在 [5, 3600]）。
+	int   diagSec = 600;
+
+	//   verbose：**排查开关**（默认关）。打开才会写"清单/明细"类日志——
+	//     SDK 服务逐项扫描、数据表逐表清单、钩子逐站点确认、叠加层注册细节、
+	//     prof/Overlay stars 周期行。正常玩家用不到。
+	//   出问题就把它改成 true → 进游戏按 ` 输入 lootmap-reload → 复现一次 → 发日志。
+	bool  verbose = false;
+
 	// ★ v0.14.0：自定义规则槽位（面板上预留的接入位，见 kRuleRows）。
 	//   ruleOn  = 这条规则开不开；
 	//   ruleRgb = 命中这条规则时星的颜色（面板上点色块改）；
@@ -871,6 +898,84 @@ std::atomic<std::uint32_t> g_starSamples { 0 };   // 已画★总数（诊断，
 std::atomic<int> g_starsLive       { 0 };
 std::atomic<int> g_starsLiveSet    { 0 };
 std::atomic<int> g_starsLiveUnique { 0 };
+
+// ───────────────────────────────────────────────────────────────────────────
+//  ★ v0.18.13：性能剖面（**纯诊断**）—— "掉帧到底花在哪"必须有数字，不能再猜。
+//
+//  背景：v0.18.10 猜是日志、v0.18.11 猜是星的顶点数，两次都改完没解决。
+//  这一版不改任何行为，只在**每个可疑的环节**上挂一个 __rdtsc 计时器：
+//      · 取色钩子（引擎每件物品每帧都要来问一次颜色）
+//      · 光点绘制钩子（引擎每画一个标记都要过）
+//      · 形状绘制钩子
+//      · 画星（DrawStars）
+//      · 画面板（DrawPanel）
+//  每 5 秒把「每秒调用次数 / 每次平均微秒 / 折算成每帧多少毫秒」写一行日志。
+//  这样一眼就能分清：是我们的插件吃掉了帧时间，还是帧时间丢在别处
+//  （游戏本体、MapSense、别的插件）。
+//
+//  成本：每处两次 __rdtsc（各 ~25 周期）+ 两次 relaxed fetch_add。被测函数本身
+//  就是上百周期起步，所以这点开销不影响结论。
+std::atomic<std::uint64_t> g_profColorCycles { 0 };   // 取色钩子总周期
+std::atomic<std::uint64_t> g_profColorCalls  { 0 };
+// ★ v0.18.15：取色钩子的总耗时里**有一大块是引擎自己的取色函数**（我们只是把它包了一层）。
+//   不扣掉的话，prof 行的 color 会把"引擎的活"算到我们头上，`ours` 就虚高。
+//   这个计数器单独记引擎那一份，报的时候从 color 里减掉，并单独列出来。
+std::atomic<std::uint64_t> g_profColorEngineCycles { 0 };
+// ★ v0.18.19：把取色钩子的耗时拆成「物品」与「非物品（怪物等）」两路 ——
+//   引擎对所有单位都来问颜色，物品只占其中一小部分；平均数会把真正的热点抹平。
+std::atomic<std::uint64_t> g_profColorItemCalls  { 0 };
+std::atomic<std::uint64_t> g_profColorItemCycles { 0 };
+std::atomic<std::uint64_t> g_profColorOtherCalls  { 0 };
+std::atomic<std::uint64_t> g_profColorOtherCycles { 0 };
+//   物品那一路再拆两段：进钩子 → 调引擎之前（闸门/清待用色/诊断），调引擎之后
+//   （品质/投票/规则0/星决策/记坐标）—— 哪段贵一测便知。
+std::atomic<std::uint64_t> g_profColorItemPreCycles  { 0 };
+std::atomic<std::uint64_t> g_profColorItemPostCycles { 0 };
+std::atomic<std::uint64_t> g_profBlobCycles  { 0 };   // 光点绘制钩子
+std::atomic<std::uint64_t> g_profBlobCalls   { 0 };
+std::atomic<std::uint64_t> g_profShapeCycles { 0 };   // 形状绘制钩子
+std::atomic<std::uint64_t> g_profShapeCalls  { 0 };
+std::atomic<std::uint64_t> g_profStarCycles  { 0 };   // DrawStars
+std::atomic<std::uint64_t> g_profStarFrames  { 0 };   // = 帧数（DrawStars 每帧恰好一次）
+std::atomic<std::uint64_t> g_profStarDrawn   { 0 };   // 累计画出的星数
+std::atomic<std::uint64_t> g_profStarCmds    { 0 };   // 星给 draw list 新增的绘制命令数
+std::atomic<std::uint64_t> g_profPanelCycles { 0 };   // DrawPanel
+std::atomic<std::uint64_t> g_profPanelFrames { 0 };
+// 宿主给我们的 ImGui 上下文。**定义提到这里**（原本在后面的"叠加层客户端"一节）：
+// 性能剖面要用它的 FrameCount 当"真实帧数"——**绝不能拿"回调被调了几次"当帧数**
+// （宿主会把回调叫得比帧率还密）。整个文件在一个匿名命名空间里，所以只能定义一次，
+// 后面那一处改成纯注释。
+ImGuiContext* g_ctx = nullptr;
+
+// TSC 频率（周期/微秒）。第一次用时标定一次：QPC 前后夹一段忙等，两边相除。
+auto ProfTscPerUs() noexcept -> double {
+	static std::atomic<double> s_hz { 0.0 };
+	double v = s_hz.load(std::memory_order_relaxed);
+	if (v > 0.0) {
+		return v;
+	}
+	LARGE_INTEGER f {}, a {}, b {};
+	if (::QueryPerformanceFrequency(&f) == 0 || f.QuadPart <= 0) {
+		return 3000.0;   // 兜底：按 3GHz 估
+	}
+	::QueryPerformanceCounter(&a);
+	const std::uint64_t t0 = __rdtsc();
+	// 忙等 ~5ms，避免 Sleep 的调度误差污染标定
+	for (;;) {
+		::QueryPerformanceCounter(&b);
+		if ((b.QuadPart - a.QuadPart) * 1000 >= f.QuadPart * 5) {
+			break;
+		}
+	}
+	const std::uint64_t t1 = __rdtsc();
+	const double us = (static_cast<double>(b.QuadPart - a.QuadPart) * 1e6)
+	                / static_cast<double>(f.QuadPart);
+	const double cyc = static_cast<double>(t1 - t0);
+	v = (us > 1.0) ? (cyc / us) : 3000.0;
+	s_hz.store(v, std::memory_order_relaxed);
+	return v;
+}
+
 // ★ v0.12.8：面板矩形（同一渲染线程内写读；面板打开时让落在里面的★不画）。
 // ★ v0.13.0：visible/inside 改成原子 —— 游戏输入线程要读它（面板挡鼠标）。
 std::atomic<bool> g_panelVisible { false };
@@ -987,6 +1092,9 @@ auto RecordStar(float x, float y, float ax, float ay, int slot, int conf,
 
 // 定义在后面（OverlayPanel 区），这里先声明：读别人进程里的指针前先探一下可读性。
 auto AddressReadable(const void* p, std::size_t n) noexcept -> bool;
+// ★ v0.18.14：热路径专用（带每帧缓存，见下面定义处的长注释）+ 每帧清缓存
+auto AddressReadableCached(const void* p, std::size_t n) noexcept -> bool;
+auto AddressCacheReset() noexcept -> void;
 
 // ───────── ★ v0.12.7：按引擎自己的公式把标记坐标换算成真实屏幕坐标 ─────────
 //  活体反汇编定案（tools/live_probe_v0127.py / _v0127b，RVA 0x79DA50）：
@@ -1000,27 +1108,39 @@ auto AddressReadable(const void* p, std::size_t n) noexcept -> bool;
 //  这就是星跑到屏幕右下角的根因。
 auto StarScreenPos(const void* obj, const void* point, float zoom,
                    float& rawX, float& rawY, float& absX, float& absY) noexcept -> bool {
-	if (point == nullptr || !AddressReadable(point, 8)) {
-		return false;
-	}
-	const auto* ints = static_cast<const std::int32_t*>(point);
-	rawX = static_cast<float>(ints[0]);
-	rawY = static_cast<float>(ints[1]);
-	absX = rawX;
-	absY = rawY;
-	if (obj != nullptr && AddressReadable(obj, sizeof(void*))) {
-		const void* ctx = *static_cast<const void* const*>(obj);
-		if (ctx != nullptr && AddressReadable(ctx, 0xd4)) {
-			const auto* f = static_cast<const std::int32_t*>(ctx);
-			const float orgX = static_cast<float>(f[0xd0 / 4]);
-			const float camX = static_cast<float>(f[0xc4 / 4]);
-			const float orgY = static_cast<float>(f[0xc0 / 4]);
-			const float camY = static_cast<float>(f[0xc8 / 4]);
-			absX = rawX + (orgX - camX) * zoom;
-			absY = rawY + (orgY - camY) * zoom;
+	// ★★ v0.18.14：这个函数是**全插件最热的一段**（每件星品每次绘制都调一次，
+	//   实测约占 15% 的光点钩子调用），而且它是"物品多就掉帧"的真凶所在：
+	//   以前这里 3 次 AddressReadable = 3 次 VirtualQuery 内核调用，
+	//   在游戏进程里被地址空间锁一挡就是几十微秒（详见 AddressReadableCached 的注释）。
+	//   现在：① 可读性走**每帧缓存**（命中就不发 syscall）；
+	//        ② 真正读取包 __try —— 缓存万一过期（那块内存被释放），
+	//           最坏也只是这一颗星不画，绝不把游戏打崩。
+	//   ⚠️ __try 函数里不能有需要析构的对象（C2712）⇒ 下面只用 POD 局部量。
+	__try {
+		if (point == nullptr || !AddressReadableCached(point, 8)) {
+			return false;
 		}
+		const auto* ints = static_cast<const std::int32_t*>(point);
+		rawX = static_cast<float>(ints[0]);
+		rawY = static_cast<float>(ints[1]);
+		absX = rawX;
+		absY = rawY;
+		if (obj != nullptr && AddressReadableCached(obj, sizeof(void*))) {
+			const void* ctx = *static_cast<const void* const*>(obj);
+			if (ctx != nullptr && AddressReadableCached(ctx, 0xd4)) {
+				const auto* f = static_cast<const std::int32_t*>(ctx);
+				const float orgX = static_cast<float>(f[0xd0 / 4]);
+				const float camX = static_cast<float>(f[0xc4 / 4]);
+				const float orgY = static_cast<float>(f[0xc0 / 4]);
+				const float camY = static_cast<float>(f[0xc8 / 4]);
+				absX = rawX + (orgX - camX) * zoom;
+				absY = rawY + (orgY - camY) * zoom;
+			}
+		}
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;   // 踩到坏指针：这一颗星不画，别的事照常
 	}
-	return true;
 }
 
 // ───────── ★ v0.12.8：雷达范围（把引擎地图的缩放按倍率缩小）─────────
@@ -1479,6 +1599,20 @@ auto ApplySetting(Settings& s, const char* key, const char* value) noexcept -> v
 		s.ownFont = ParseBool(value, s.ownFont);
 		return;
 	}
+	// ★ v0.18.16：日志体积开关
+	if (std::strcmp(key, "evidence") == 0) {
+		s.evidence = ParseBool(value, s.evidence);
+		return;
+	}
+	if (std::strcmp(key, "diag_sec") == 0) {
+		const int v = ParseInt(value, s.diagSec);
+		s.diagSec = (v < 5) ? 5 : ((v > 3600) ? 3600 : v);
+		return;
+	}
+	if (std::strcmp(key, "verbose") == 0) {
+		s.verbose = ParseBool(value, s.verbose);
+		return;
+	}
 	// ★ v0.14.0：自定义规则槽位（rule0_enable / rule0_rgb / rule0_name …）
 	for (int r = 0; r < kRuleCount; ++r) {
 		const char*      base  = kRuleRows[r].key;      // "rule0" …
@@ -1652,6 +1786,18 @@ auto SaveSettings(const D2RL::PluginContext* ctx) noexcept -> bool {
 	out.Append("# (leave true to hide the engine's own little markers on those items).\n");
 	out.Append("engine_colour_rescue = %s\n", g_settings.engineColourRescue ? "true" : "false");
 	out.Append("own_font = %s\n", g_settings.ownFont ? "true" : "false");
+	out.Append("\n# ── 日志体积（★ v0.18.16）────────────────────────────────────\n");
+	out.Append("# evidence = true 才会写 STARID 取证行（每行约 550 字节）。\n");
+	out.Append("# 当初为逆向「蓝装前缀是哪几个字节」加的，使命已完成，默认关。\n");
+	out.Append("# 关掉之后 loot-map.log 体积降约 70%。要再取证就改 true 然后 lootmap-reload。\n");
+	out.Append("evidence = %s\n", g_settings.evidence ? "true" : "false");
+	out.Append("# 周期性诊断（diag: / prof: / Overlay stars）的间隔秒数，范围 5~3600。\n");
+	out.Append("# 日常玩留 60（默认）；要调性能或排查问题时改成 5。\n");
+	out.Append("diag_sec = %d\n", g_settings.diagSec);
+	out.Append("# verbose = true 才写“清单/明细”类日志（SDK 逐项扫描、数据表清单、钩子逐站点、\n");
+	out.Append("# 叠加层注册细节、prof/Overlay stars 周期行）。正常玩家用不到。\n");
+	out.Append("# 出问题时改 true → 进游戏按 ` 输入 lootmap-reload → 复现一次 → 发日志。\n");
+	out.Append("verbose = %s\n", g_settings.verbose ? "true" : "false");
 	out.Append("\n# Custom rule slots (reserved): enable / colour / display name.\n");
 	for (int r = 0; r < kRuleCount; ++r) {
 		out.Append("%s_enable = %s\n", kRuleRows[r].key, g_settings.ruleOn[r] ? "true" : "false");
@@ -1912,6 +2058,19 @@ auto TryInstallBlobColorPointerHook() noexcept -> void {
 	if (g_blobPtrHookInstalled.load(std::memory_order_relaxed)) {
 		return;
 	}
+	// ★ v0.18.20：**10 秒节流** —— 这个函数在取色钩子的最前面，每秒被调 2~5 万次。
+	//   实测（2026-09-26 日志）：automap-blob 的槽位是 NULL，第一次就"pointer hook
+	//   skipped"，但跳过之后**每次取色仍在跑 GetModuleHandleW**（加载器锁 + 宽字符串
+	//   扫描，实测 ~3.5us/次）⇒ 白白吃掉 0.9~1.7ms/帧（占帧时间 ~12%）。
+	//   改成：没装上时每 10 秒才真正重试一次，平时一次 GetTickCount64 就挡住。
+	static std::atomic<std::uint64_t> s_nextTryMs { 0 };
+	{
+		const std::uint64_t nowT = ::GetTickCount64();
+		if (nowT < s_nextTryMs.load(std::memory_order_relaxed)) {
+			return;
+		}
+		s_nextTryMs.store(nowT + 10000, std::memory_order_relaxed);
+	}
 
 	HMODULE h = ::GetModuleHandleW(L"d2rl-plugin-automap-blob.dll");
 	if (h == nullptr) {
@@ -2048,7 +2207,7 @@ std::atomic<bool> g_blobIconHookInstalled { false };
 //   消费 starSlot（单令牌）→ 记星坐标（point+0/+4）→ 需要时就地返回跳过引擎绘制。
 //   C 点钩子保留作后备；pending 是单令牌，谁先抢到谁记，不会画双星。
 //   第 4 个 float 形参 = xmm3 = 引擎传给 sub_858510 的"缩放"（寄存器原样保留）。
-auto __fastcall HookBlobIconPrep(void* obj, const void* point, void* style, float zoom) noexcept -> int {
+auto __fastcall HookBlobIconPrepInner(void* obj, const void* point, void* style, float zoom) noexcept -> int {
 	g_siteATotal.fetch_add(1, std::memory_order_relaxed);   // ★ v0.18.7 诊断：A 点被叫总次数
 	RememberRenderCtx(obj, zoom);   // ★ v0.12.8：给雷达倍率留一份"当帧 ctx + 缩放"
 	const int starSlot = g_starSlotPending.exchange(0, std::memory_order_relaxed) - 1;
@@ -2098,6 +2257,15 @@ auto __fastcall HookBlobIconPrep(void* obj, const void* point, void* style, floa
 	return 0;   // 正常进引擎绘制
 }
 
+//  ★ v0.18.13：外层只做计时，真正的逻辑在 Inner（见上面性能剖面说明）。
+auto __fastcall HookBlobIconPrep(void* obj, const void* point, void* style, float zoom) noexcept -> int {
+	const std::uint64_t t0 = __rdtsc();
+	const int r = HookBlobIconPrepInner(obj, point, style, zoom);
+	g_profBlobCycles.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	g_profBlobCalls.fetch_add(1, std::memory_order_relaxed);
+	return r;
+}
+
 // 钩子 C（标记函数直连那笔）：★ v0.12.6 实测这条路对物品标记不执行
 // （v0.12.5 全会话零命中），保留作后备：万一某些路径真的走 C，
 // pending 单令牌谁先抢到谁记坐标，闸门照常跳灰块。
@@ -2123,7 +2291,7 @@ auto __fastcall HookBlobShapeBase(void* obj, const void* point, void* /*style*/,
 // 钩子 S1..S5（F1 跳转表形状分支里的 5 个形状绘制调用点 = 灰底块真身）：
 // 星品时 g_skipSiteB 拉闸 → 就地返回，"额外图形"不画；非星品照常进原函数。
 // 参数不认识也不需要认识 —— 小桩会原样保存/还原所有易失寄存器。
-auto __fastcall HookShapeDrawer(void*, const void*, void*, float) noexcept -> int {
+auto __fastcall HookShapeDrawerInner(void*, const void*, void*, float) noexcept -> int {
 	g_shapeTotal.fetch_add(1, std::memory_order_relaxed);   // ★ v0.18.7 诊断：形状点被叫总次数
 	if (g_skipSiteB.exchange(0, std::memory_order_relaxed) != 0) {   // ★ v0.14.9：同上，回退成一次性
 		g_shapeHits.fetch_add(1, std::memory_order_relaxed);
@@ -2131,6 +2299,15 @@ auto __fastcall HookShapeDrawer(void*, const void*, void*, float) noexcept -> in
 		return 1;                      // 就地返回，形状/底块不画
 	}
 	return 0;
+}
+
+// ★ v0.18.13：外层只做计时（这个点是全进程最热的 —— 每个标记图形都过一次）。
+auto __fastcall HookShapeDrawer(void* a, const void* b, void* c, float d) noexcept -> int {
+	const std::uint64_t t0 = __rdtsc();
+	const int r = HookShapeDrawerInner(a, b, c, d);
+	g_profShapeCycles.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	g_profShapeCalls.fetch_add(1, std::memory_order_relaxed);
+	return r;
 }
 
 // ─────────────────────── 机器码小桩（绝对地址版）───────────────────────
@@ -2369,7 +2546,8 @@ auto TryInstallBlobIconColourPatch() noexcept -> void {
 
 		st.page    = static_cast<std::uint8_t*>(page);
 		st.patched = true;
-		{
+		if (g_settings.verbose) {
+			// ★ v0.18.17：逐站点确认只在 verbose 写（默认只留下面那句汇总）。
 			char line[160] {};
 			std::snprintf(line, sizeof(line),
 				"Loot Map: blob draw call site %s (RVA 0x%06X) patched (stub delta=%+d MB).",
@@ -2435,7 +2613,8 @@ auto PickEngineColour(const std::atomic<std::uint32_t>* votes, int& outColour) n
 	return true;
 }
 
-auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std::int32_t* out2) noexcept -> bool {
+auto __fastcall HookGetUnitColorIndexInner(const void* unit, std::int32_t* out1, std::int32_t* out2) noexcept -> bool {
+	const std::uint64_t tIn = __rdtsc();
 	GetUnitColorIndexFn original = g_originalGetUnitColorIndex;
 
 	if (original == nullptr || unit == nullptr || out1 == nullptr || out2 == nullptr) {
@@ -2477,7 +2656,8 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 		static std::atomic<std::uint64_t> s_lastSig   { 0 };
 		const std::uint64_t now  = ::GetTickCount64();
 		const std::uint64_t last = s_lastTick.load(std::memory_order_relaxed);
-		if (now - last >= 5000) {
+		// ★ v0.18.16：间隔改成配置项 diag_sec（默认 60 秒，原来是硬编码 5 秒）
+		if (now - last >= static_cast<std::uint64_t>(g_settings.diagSec) * 1000ULL) {
 			const std::uint64_t sig =
 				  static_cast<std::uint64_t>(g_itemCalls) << 0
 				| static_cast<std::uint64_t>(g_siteAHits.load(std::memory_order_relaxed)) << 20
@@ -2510,9 +2690,138 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 		}
 	}
 
-	if (type != kUnitTypeItem) {
-		return original(unit, out1, out2);   // 不是物品：一个字节都不动
+	// ── ★ v0.18.13：性能剖面 —— 每 5 秒一行，回答"帧时间到底花在哪" ──
+	//   为什么非得有这个：v0.18.10 猜"日志写太多"、v0.18.11 猜"星的顶点太多"，
+	//   两次都是改完没解决。这一行把每个环节的**实测**耗时写成数字，不再猜。
+	//   读法：
+	//     fps / frameMs = 这段窗口内的真实帧率与帧时间（帧数由 DrawStars 计，每帧恰好一次）
+	//     color/blob/shape = 三个钩子：每秒被调几次、每次几微秒、折算成每帧几毫秒
+	//     hook  = 三个钩子合计每帧毫秒，后面括号是它占帧时间的百分比
+	//     star  = 画星每帧毫秒 + 每帧几颗星 + 星新增了几个绘制命令
+	//     panel = 画面板每帧毫秒
+	//   判据：**hook% 只有几个点 ⇒ 掉帧不在本插件**，要去查游戏本体 / MapSense / 别的插件。
+	{
+		static std::atomic<std::uint64_t> s_profLastMs { 0 };
+		static std::uint64_t s_pc = 0, s_pb = 0, s_ps = 0;
+		static std::uint64_t s_pcc = 0, s_pbc = 0, s_psc = 0, s_pce = 0;
+		static std::uint64_t s_stc = 0, s_std = 0, s_stcmd = 0, s_stcall = 0;
+		static std::uint64_t s_pnc = 0, s_pnf = 0;
+		static std::uint64_t s_pdc2 = 0, s_pcc2 = 0, s_pdo = 0, s_pco = 0, s_pcpre = 0, s_pcpos = 0;
+		static int           s_profFrame = 0;
+		const std::uint64_t pnow  = ::GetTickCount64();
+		const std::uint64_t plast = s_profLastMs.load(std::memory_order_relaxed);
+		// ★ v0.18.16：间隔改成配置项 diag_sec（默认 300 秒，原来是硬编码 5 秒）
+		// ★ v0.18.18：prof 行**不再受 verbose 门控** —— 它是唯一能回答"帧时间花在哪"
+		//   的仪表（300 秒一条约 320 字节，一小时才 4KB）。没有它，"星星掉帧"就只能猜。
+		// ★ v0.18.21：第一次进这段（plast=0）先立基准时间 —— 不然首窗口=开机以来的
+		//   时长（实测 win=63581s），数字不可信，而且 300 秒间隔下短会话永远等不到
+		//   第二个窗口、一条 prof 都没有。立完基准后，首窗口就从"首次取色"起算。
+		if (plast == 0) {
+			s_profLastMs.store(pnow, std::memory_order_relaxed);
+		} else if (pnow - plast >= static_cast<std::uint64_t>(g_settings.diagSec) * 1000ULL) {
+			s_profLastMs.store(pnow, std::memory_order_relaxed);
+			const bool saneWin = (pnow - plast <= 120000ULL);
+			auto take = [](std::atomic<std::uint64_t>& c, std::uint64_t& prev) noexcept -> std::uint64_t {
+				const std::uint64_t v = c.load(std::memory_order_relaxed);
+				const std::uint64_t d = v - prev;
+				prev = v;
+				return d;
+			};
+			const std::uint64_t dc   = take(g_profColorCalls,  s_pc);
+			const std::uint64_t db   = take(g_profBlobCalls,   s_pb);
+			const std::uint64_t dsh  = take(g_profShapeCalls,  s_ps);
+			const std::uint64_t cc   = take(g_profColorCycles, s_pcc);
+			const std::uint64_t ce   = take(g_profColorEngineCycles, s_pce);   // 引擎自己那一份
+			const std::uint64_t cb   = take(g_profBlobCycles,  s_pbc);
+			const std::uint64_t csh  = take(g_profShapeCycles, s_psc);
+			const std::uint64_t stc  = take(g_profStarCycles,  s_stc);
+			const std::uint64_t stdr = take(g_profStarDrawn,   s_std);
+			const std::uint64_t stcm = take(g_profStarCmds,    s_stcmd);
+			const std::uint64_t stcl = take(g_profStarFrames,  s_stcall);
+			const std::uint64_t pnc  = take(g_profPanelCycles, s_pnc);
+			// ★ v0.18.19：取色钩子按「物品/非物品」和「pre/post」拆开
+			const std::uint64_t dci  = take(g_profColorItemCalls,  s_pdc2);
+			const std::uint64_t cci  = take(g_profColorItemCycles, s_pcc2);
+			const std::uint64_t dco  = take(g_profColorOtherCalls, s_pdo);
+			const std::uint64_t cco  = take(g_profColorOtherCycles, s_pco);
+			const std::uint64_t cpre = take(g_profColorItemPreCycles,  s_pcpre);
+			const std::uint64_t cpos = take(g_profColorItemPostCycles, s_pcpos);
+			const std::uint64_t pnf  = take(g_profPanelFrames, s_pnf);
+
+			// ★ 真帧数只能看 ImGui 的 FrameCount：宿主会把回调叫得比帧率还密，
+			//   拿"回调次数"当帧数会把 fps 算高好几倍（v0.18.11 就是这么被误导的）。
+			//   ⚠️ 这里**绝不能 return** —— 这一段在物品判定之前，提前返回会让
+			//   那一次取色不被处理（等于随机漏掉一个物品的星）。
+			ImGuiContext* pc = g_ctx;
+			const int curFrame = (pc != nullptr) ? pc->FrameCount : 0;
+			const int frames   = curFrame - s_profFrame;
+			s_profFrame = curFrame;
+			if (saneWin && curFrame != 0 && frames > 0) {
+			const double perUs = ProfTscPerUs();      // TSC 周期/微秒
+			const double winS  = static_cast<double>(pnow - plast) / 1000.0;
+			const double fN    = static_cast<double>(frames);
+			const double fps   = (winS > 0.0) ? fN / winS : 0.0;
+			const double frameMs = (fps > 0.0) ? 1000.0 / fps : 0.0;
+			// 各环节窗口内总微秒 → 每帧毫秒（一律除以**真帧数**）
+			auto msPerFrame = [&](std::uint64_t cyc) noexcept -> double {
+				return (static_cast<double>(cyc) / perUs) / 1000.0 / fN;
+			};
+			auto usPerCall = [&](std::uint64_t cyc, std::uint64_t n) noexcept -> double {
+				return (n > 0) ? (static_cast<double>(cyc) / perUs) / static_cast<double>(n) : 0.0;
+			};
+			const double itemMs  = msPerFrame(cci);
+			const double otherMs = msPerFrame(cco);
+			const double preMs   = msPerFrame(cpre);
+			const double postMs  = msPerFrame(cpos);
+			const double engMs   = msPerFrame(ce);                       // 引擎自己的取色函数
+			const double colorMs = msPerFrame(cc > ce ? (cc - ce) : 0);  // ★ 只算"我们自己"那一份
+			const double blobMs  = msPerFrame(cb);
+			const double shapeMs = msPerFrame(csh);
+			const double starMs  = msPerFrame(stc);
+			const double panelMs = msPerFrame(pnc);
+			const double hookMs  = colorMs + blobMs + shapeMs;
+			const double hookPct = (frameMs > 0.0) ? hookMs / frameMs * 100.0 : 0.0;
+			const double oursMs  = hookMs + starMs + panelMs;
+			const double oursPct = (frameMs > 0.0) ? oursMs / frameMs * 100.0 : 0.0;
+
+			char pline[600] {};
+			std::snprintf(pline, sizeof(pline),
+				"prof: win=%.1fs frames=%d fps=%.1f frameMs=%.1f | "
+				"color=%.0f/s %.2fus -> %.2fms/f | blob=%.0f/s %.2fus -> %.2fms/f | "
+				"shape=%.0f/s %.2fus -> %.2fms/f | eng(游戏自己)=%.2fms/f | "
+				"item=%.0f/s %.2fus | other=%.0f/s %.2fus | pre=%.2f post=%.2f ms/f | "
+				"hook=%.2fms/f (%.1f%%) | "
+				"star=%.2fms/f stars=%.1f cmds=%.1f | panel=%.2fms/f | ours=%.2fms/f (%.1f%%)",
+				winS, frames, fps, frameMs,
+				static_cast<double>(dc) / winS, usPerCall(cc, dc), colorMs,
+				static_cast<double>(db) / winS, usPerCall(cb, db), blobMs,
+				static_cast<double>(dsh) / winS, usPerCall(csh, dsh), shapeMs,
+				engMs,
+				static_cast<double>(dci) / winS, usPerCall(cci, dci),
+				static_cast<double>(dco) / winS, usPerCall(cco, dco),
+				preMs, postMs,
+				hookMs, hookPct,
+				starMs,
+				static_cast<double>(stdr) / fN,
+				static_cast<double>(stcm) / fN,
+				panelMs, oursMs, oursPct);
+			LogInfo(pline);
+			(void)pnf; (void)stcl;   // 只作诊断，不进公式
+			}
+		}
 	}
+
+	if (type != kUnitTypeItem) {
+		g_profColorOtherCalls.fetch_add(1, std::memory_order_relaxed);
+		g_profColorOtherCycles.fetch_add(__rdtsc() - tIn, std::memory_order_relaxed);
+		const std::uint64_t tEng = __rdtsc();
+		const bool r = original(unit, out1, out2);
+		g_profColorEngineCycles.fetch_add(__rdtsc() - tEng, std::memory_order_relaxed);
+		return r;   // 不是物品：一个字节都不动
+	}
+	g_profColorItemCalls.fetch_add(1, std::memory_order_relaxed);
+	g_profColorItemCycles.fetch_add(__rdtsc() - tIn, std::memory_order_relaxed);
+	const std::uint64_t tPost = __rdtsc();   // 引擎那一段单独走 tEng
 
 	const auto* bytes = static_cast<const std::uint8_t*>(unit);
 	const std::uint32_t id      = *reinterpret_cast<const std::uint32_t*>(bytes + 0x08);
@@ -2521,7 +2830,12 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 
 	const std::int32_t beforeOut1 = *out1;
 	const std::int32_t beforeOut2 = *out2;
+	// ★ v0.18.15：引擎那一份单独计时，报 prof 时从我们的 color 里减掉。
+	g_profColorItemPreCycles.fetch_add(__rdtsc() - tPost, std::memory_order_relaxed);
+	const std::uint64_t tEng = __rdtsc();
 	const bool originalResult = original(unit, out1, out2);
+	g_profColorEngineCycles.fetch_add(__rdtsc() - tEng, std::memory_order_relaxed);
+	const std::uint64_t tAfterEng = __rdtsc();
 	// ★ v0.13.0：原始函数调用**之后**的 out1 = 引擎自己给这件物品选的色号。
 	//   这是"引擎怎么分类这件物品"的第一手信息（见文件头 v0.13.0 说明）。
 	const std::int32_t engineOut1 = *out1;
@@ -2627,7 +2941,10 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 		//   错放到了另一个已经不再使用的取色钩子里，所以一行都没打出来）。
 		//   同一件物品（同一 unit）最多每 3 秒写一行：把"这颗星画在什么物品上"
 		//   记成可复查的证据（底材类型号 + 引擎色号 + 我们读到的品质 + 原始字节）。
-		if (starSlot >= 0 && unit != nullptr) {
+		//   ★ v0.18.16：**默认关**（配置 evidence=false）。它是日志体积的最大来源
+		//   （占 68%，每行约 550 字节），而且每件星品每次取色还要跑 256~768 次
+		//   线性查找。使命已完成，需要时改 toml 再 lootmap-reload。
+		if (g_settings.evidence && starSlot >= 0 && unit != nullptr) {
 			const auto* ub = static_cast<const std::uint8_t*>(unit);
 			const std::uint32_t typeNo = *reinterpret_cast<const std::uint32_t*>(ub + 0x04);
 			const std::uint32_t key =
@@ -2730,9 +3047,22 @@ auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std:
 		if (g_settings.rgbOn[slotIdx]) {
 			SetPendingRgb(slotIdx);
 		}
+		g_profColorItemPostCycles.fetch_add(__rdtsc() - tAfterEng, std::memory_order_relaxed);
 		return true;
 	}
+	g_profColorItemPostCycles.fetch_add(__rdtsc() - tAfterEng, std::memory_order_relaxed);
 	return originalResult;
+}
+
+// ★ v0.18.13：外层只做计时。这个钩子是**最热**的一个 —— 引擎每件物品每帧都要来
+//  问一次颜色（实测 ~13,400 次/秒）。所以"我们的插件到底吃掉了多少帧时间"，
+//  看这一行的数字最直接。
+auto __fastcall HookGetUnitColorIndex(const void* unit, std::int32_t* out1, std::int32_t* out2) noexcept -> bool {
+	const std::uint64_t t0 = __rdtsc();
+	const bool r = HookGetUnitColorIndexInner(unit, out1, out2);
+	g_profColorCycles.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	g_profColorCalls.fetch_add(1, std::memory_order_relaxed);
+	return r;
 }
 
 // ══════════════ 原生面板（SDK Panel 服务）—— v0.8.0 ══════════════
@@ -3856,9 +4186,14 @@ auto ProbeServiceScan(const D2RL::PluginContext* ctx, const char* stage) noexcep
 	const char* tag = (stage != nullptr) ? stage : "?";
 	char line[256] {};
 
-	std::snprintf(line, sizeof(line), "PROBE[%s] SDK service scan (%u services):",
-		tag, static_cast<unsigned>(sizeof(kProbeServices) / sizeof(kProbeServices[0])));
-	LogInfo(line);
+	// ★ v0.18.17：逐项清单只在 verbose 打开时写。默认只留最后那行汇总 ——
+	//   汇总行是"SDK 服务齐不齐"的唯一判据（本机恒为 17/18，缺 Localization v2）。
+	const bool list = g_settings.verbose;
+	if (list) {
+		std::snprintf(line, sizeof(line), "PROBE[%s] SDK service scan (%u services):",
+			tag, static_cast<unsigned>(sizeof(kProbeServices) / sizeof(kProbeServices[0])));
+		LogInfo(line);
+	}
 
 	std::uint32_t available = 0;
 	for (const ProbeServiceEntry& entry : kProbeServices) {
@@ -3871,10 +4206,12 @@ auto ProbeServiceScan(const D2RL::PluginContext* ctx, const char* stage) noexcep
 			serviceVersion = *(static_cast<const std::uint32_t*>(service) + 1);
 			++available;
 		}
-		std::snprintf(line, sizeof(line), "PROBE[%s]   %-16s want=v%u -> %-18s size=%u ver=%u",
-			tag, entry.name, static_cast<unsigned>(entry.abiVersion),
-			QueryResultText(result), static_cast<unsigned>(serviceSize), static_cast<unsigned>(serviceVersion));
-		LogInfo(line);
+		if (list) {
+			std::snprintf(line, sizeof(line), "PROBE[%s]   %-16s want=v%u -> %-18s size=%u ver=%u",
+				tag, entry.name, static_cast<unsigned>(entry.abiVersion),
+				QueryResultText(result), static_cast<unsigned>(serviceSize), static_cast<unsigned>(serviceVersion));
+			LogInfo(line);
+		}
 	}
 	std::snprintf(line, sizeof(line), "PROBE[%s] SDK service scan done: %u/%u available.",
 		tag, static_cast<unsigned>(available),
@@ -4184,6 +4521,10 @@ auto ProbeCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command
 auto ProbeDataTablesLoadedCallback(const D2RL::PluginContext* ctx,
                                    const D2RL::Lifecycle::DataTablesLoadedEvent* event,
                                    void* /*userData*/) noexcept -> void {
+	// ★ v0.18.17：默认不写数据表清单（几十行）。要查就开 verbose。
+	if (!g_settings.verbose) {
+		return;
+	}
 	char line[200] {};
 	std::snprintf(line, sizeof(line), "PROBE tables: data tables loaded (revision=%llu).",
 		static_cast<unsigned long long>((event != nullptr) ? event->revision : 0));
@@ -4194,6 +4535,10 @@ auto ProbeDataTablesLoadedCallback(const D2RL::PluginContext* ctx,
 auto ProbeLocalPlayerReadyCallback(const D2RL::PluginContext* ctx,
                                    const D2RL::Lifecycle::GameplayEvent* /*event*/,
                                    void* /*userData*/) noexcept -> void {
+	// ★ v0.18.17：默认不写（服务扫描 + "local player is ready"）。
+	if (!g_settings.verbose) {
+		return;
+	}
 	LogInfo("PROBE item: local player is ready.");
 	ProbeServiceScan(ctx, "ingame");
 
@@ -4223,7 +4568,9 @@ auto InstallProbeListeners(const D2RL::PluginContext* ctx) noexcept -> void {
 		listener.callback   = &ProbeDataTablesLoadedCallback;
 		if (lifecycle->registerDataTablesLoadedListener(ctx, &listener, &g_probeTablesListener)
 		    == D2RL::Lifecycle::Result::Success) {
-			LogInfo("PROBE: data-table listener registered.");
+			if (g_settings.verbose) {
+				LogInfo("PROBE: data-table listener registered.");
+			}
 		}
 	}
 
@@ -4234,7 +4581,9 @@ auto InstallProbeListeners(const D2RL::PluginContext* ctx) noexcept -> void {
 		listener.callback   = &ProbeLocalPlayerReadyCallback;
 		if (lifecycle->registerGameplayEventListener(ctx, &listener, &g_probePlayerListener)
 		    == D2RL::Lifecycle::Result::Success) {
-			LogInfo("PROBE: local-player-ready listener registered.");
+			if (g_settings.verbose) {
+				LogInfo("PROBE: local-player-ready listener registered.");
+			}
 		}
 	}
 }
@@ -4329,6 +4678,80 @@ auto AddressReadable(const void* p, std::size_t n) noexcept -> bool {
 	const auto base  = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
 	return start + n <= base + info.RegionSize;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+//  ★★ v0.18.14：把 AddressReadable 从热路径上摘下来（修"物品多就掉帧"的真凶）
+//
+//  证据链（都是实测，不是推测）：
+//    · v0.18.13 的性能剖面：**光点绘制钩子每次 15.18 微秒**，而它函数体里只有
+//      几个原子操作 —— 同样多原子的形状钩子只要 0.02 微秒。
+//    · 本机微基准（F:\WorkBuddy\2026-09-25-18-10-06\vq_bench.c）：
+//        VirtualQuery        = 0.347 us/次
+//        3× VirtualQuery     = 1.112 us
+//        3× lock xchg        = 0.016 us   ← 原子操作根本不贵
+//      也就是说：钩子里那 15 微秒**不可能**是它自己的代码。
+//    · 算账：星品那一笔占 15% 的调用，把 3.54 ms/帧 全算在它头上 = 每次约 98 微秒。
+//      而 StarScreenPos 里正好有 **3 次 AddressReadable**（= 3 次内核调用）。
+//  ⇒ 结论：**瓶颈是 VirtualQuery 这个系统调用**。它要拿进程的地址空间锁，
+//    游戏进程里线程多、内存分配频繁，一旦被抢就会阻塞几十微秒。
+//  这同时解释了两个一直想不通的现象：
+//    ① **关掉星标就不掉帧** —— 关掉后 starSlot 永不为真 ⇒ StarScreenPos 一次都不调；
+//    ② **换星的画法完全没用** —— 这笔开销跟画什么、画几个顶点毫无关系。
+//
+//  修法两层，缺一不可：
+//    ① **每帧失效的小缓存**：obj / ctx 这两个指针整帧都是同一个，point 也落在少数
+//       几块堆区里 ⇒ 缓存命中后一次 syscall 都不发。
+//    ② **SEH 兜住真正的读取**：缓存可能"过期"（那块内存被释放了），所以读取本身
+//       包 __try —— 万一真踩到坏指针，最坏也只是这一颗星不画，绝不崩游戏。
+//  注意：__try 所在函数里不能有需要析构的对象（C2712），所以下面只用 POD 局部量。
+struct AddrRange {
+	std::uintptr_t base;
+	std::uintptr_t end;
+};
+constexpr int kAddrCacheSlots = 16;
+AddrRange g_addrCache[kAddrCacheSlots] {};   // 只有渲染线程读写
+int       g_addrCacheCount = 0;
+
+auto AddressCacheReset() noexcept -> void {
+	g_addrCacheCount = 0;
+}
+
+// 查缓存 → 没命中才发一次 VirtualQuery，并把**整块已提交区域**记进缓存。
+// 记区域（而不是记那一页）很重要：VirtualQuery 验证过的正是 base..base+RegionSize。
+auto AddressReadableCached(const void* p, std::size_t n) noexcept -> bool {
+	const auto a = reinterpret_cast<std::uintptr_t>(p);
+	if (a == 0) {
+		return false;
+	}
+	const auto b = a + n;
+	for (int i = 0; i < g_addrCacheCount; ++i) {
+		if (a >= g_addrCache[i].base && b <= g_addrCache[i].end) {
+			return true;
+		}
+	}
+	if (p == nullptr) {
+		return false;
+	}
+	MEMORY_BASIC_INFORMATION info {};
+	if (::VirtualQuery(p, &info, sizeof(info)) == 0) {
+		return false;
+	}
+	if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		return false;
+	}
+	const auto base = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+	if (b > base + info.RegionSize) {
+		return false;
+	}
+	if (g_addrCacheCount >= kAddrCacheSlots) {
+		g_addrCacheCount = 0;   // 满了就整体清掉重来（命中率主要靠 obj/ctx/point 的复用）
+	}
+	g_addrCache[g_addrCacheCount].base = base;
+	g_addrCache[g_addrCacheCount].end  = base + info.RegionSize;
+	++g_addrCacheCount;
+	return true;
+}
+
 
 auto OverlayProbeHit(int index, const void* ctx, void* userData) noexcept -> void {
 	const std::uint32_t hit = g_ovlHits[index].fetch_add(1, std::memory_order_relaxed) + 1;
@@ -4443,7 +4866,7 @@ std::atomic<std::uint32_t> g_draws { 0 };
 std::uint32_t              g_verifyTries = 0;
 std::uint32_t              g_validateTries = 0;
 std::uint32_t              g_validateExceptions = 0;
-ImGuiContext*              g_ctx       = nullptr;
+// ★ v0.18.13：g_ctx 的定义已提到前面（性能剖面要用它的 FrameCount 数真帧数），这里不再重复。
 int                        g_lastFrame = -1;
 ImFont*                    g_cjkFont   = nullptr;
 bool                       g_cjkHasDigits = false;   // 选中字体里有没有 '0'（没有就不能渲染带数字的中文行）
@@ -5475,6 +5898,783 @@ auto ProbeHeap(void* p) noexcept -> int {
 	}
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//  ★★ v0.18.14：面板字体的**码位白名单**（原来是整块 CJK 汉字区 0x4E00-0x9FFF）
+//
+//  为什么必须收窄：ImGui 的字体图集是**所有字体共用一张纹理**（宿主那边实测 19 块字体），
+//  打包器一旦装不下，会把装不下的字形**静默地**标记成"未打包"
+//  （third_party\imgui\imgui_draw.cpp 里那句 "FIXME: We are not handling packing
+//   failure here ... mark missing glyphs as non-packed" 就是它）——
+//  现象正是用户截图里那样：有些字显示、有些字凭空消失，而且不同会话还不一样。
+//  原来那块汉字区 = 20,992 个码位，18px 下要吃掉约 8.4 兆像素的图集面积；
+//  下面这张表只有 758 段 / 1583 个码位（面板真正会上屏的字），图集占用降一个数量级。
+//
+//  ★ 重新生成：`python tools\gen_font_ranges.py --apply`
+//    （从源码的字符串字面量里抽字符；**面板文案必须是字面量**，加新文案后要重跑一次，
+//      否则新字会显示成空白。）
+//  ⚠️ 别再把范围写回 0x4E00-0x9FFF —— 那会重新把别的插件的字挤掉。
+constexpr ImWchar kPanelGlyphRanges[] {
+	0x0020, 0x00FF,
+	0x2010, 0x2027,
+	0x2190, 0x2192,
+	0x21D2, 0x21D2,
+	0x2260, 0x2260,
+	0x2265, 0x2265,
+	0x2460, 0x2500,
+	0x2550, 0x2550,
+	0x2605, 0x2605,
+	0x26A0, 0x26A0,
+	0x3000, 0x303F,
+	0x4E00, 0x4E01,
+	0x4E07, 0x4E07,
+	0x4E09, 0x4E0B,
+	0x4E0D, 0x4E0E,
+	0x4E11, 0x4E11,
+	0x4E13, 0x4E14,
+	0x4E1C, 0x4E1C,
+	0x4E22, 0x4E22,
+	0x4E24, 0x4E24,
+	0x4E2A, 0x4E2A,
+	0x4E2D, 0x4E2D,
+	0x4E32, 0x4E32,
+	0x4E34, 0x4E34,
+	0x4E3A, 0x4E3B,
+	0x4E3E, 0x4E3E,
+	0x4E45, 0x4E45,
+	0x4E48, 0x4E49,
+	0x4E4B, 0x4E4B,
+	0x4E4E, 0x4E4E,
+	0x4E5F, 0x4E5F,
+	0x4E71, 0x4E71,
+	0x4E86, 0x4E86,
+	0x4E8B, 0x4E8C,
+	0x4E8E, 0x4E8E,
+	0x4E94, 0x4E94,
+	0x4E9B, 0x4E9B,
+	0x4EA4, 0x4EA4,
+	0x4EA7, 0x4EA7,
+	0x4EAB, 0x4EAB,
+	0x4EAE, 0x4EAE,
+	0x4EB2, 0x4EB2,
+	0x4EBA, 0x4EBA,
+	0x4EC0, 0x4EC0,
+	0x4EC5, 0x4EC5,
+	0x4ECD, 0x4ECE,
+	0x4EE3, 0x4EE5,
+	0x4EEC, 0x4EEC,
+	0x4EF6, 0x4EF7,
+	0x4EFB, 0x4EFB,
+	0x4EFD, 0x4EFD,
+	0x4F18, 0x4F18,
+	0x4F1A, 0x4F1A,
+	0x4F20, 0x4F20,
+	0x4F2F, 0x4F2F,
+	0x4F3C, 0x4F3C,
+	0x4F46, 0x4F46,
+	0x4F4D, 0x4F4F,
+	0x4F53, 0x4F53,
+	0x4F55, 0x4F55,
+	0x4F59, 0x4F59,
+	0x4F5C, 0x4F5C,
+	0x4F60, 0x4F60,
+	0x4F8B, 0x4F8B,
+	0x4F9B, 0x4F9B,
+	0x4F9D, 0x4F9D,
+	0x4FBF, 0x4FBF,
+	0x4FDD, 0x4FDD,
+	0x4FE1, 0x4FE1,
+	0x4FEE, 0x4FEE,
+	0x500D, 0x500D,
+	0x5019, 0x5019,
+	0x503C, 0x503C,
+	0x5047, 0x5047,
+	0x504F, 0x504F,
+	0x505A, 0x505A,
+	0x505C, 0x505C,
+	0x5076, 0x5076,
+	0x50CF, 0x50CF,
+	0x513F, 0x513F,
+	0x5141, 0x5141,
+	0x5145, 0x5145,
+	0x5148, 0x5149,
+	0x514D, 0x514D,
+	0x5151, 0x5151,
+	0x515C, 0x515C,
+	0x5165, 0x5165,
+	0x5168, 0x5168,
+	0x516C, 0x516D,
+	0x5171, 0x5171,
+	0x5173, 0x5173,
+	0x5176, 0x5177,
+	0x517C, 0x517C,
+	0x5185, 0x5185,
+	0x518C, 0x518D,
+	0x5192, 0x5192,
+	0x5199, 0x5199,
+	0x51B2, 0x51B3,
+	0x51B5, 0x51B5,
+	0x51C0, 0x51C0,
+	0x51C6, 0x51C6,
+	0x51E0, 0x51E1,
+	0x51ED, 0x51ED,
+	0x51F6, 0x51F6,
+	0x51F9, 0x51FB,
+	0x51FD, 0x51FD,
+	0x5206, 0x5207,
+	0x5211, 0x5211,
+	0x5217, 0x5217,
+	0x5219, 0x521A,
+	0x521D, 0x521D,
+	0x5220, 0x5220,
+	0x5224, 0x5224,
+	0x522B, 0x522B,
+	0x5230, 0x5230,
+	0x5236, 0x5237,
+	0x523B, 0x523B,
+	0x524D, 0x524D,
+	0x5256, 0x5256,
+	0x5269, 0x526A,
+	0x529F, 0x52A1,
+	0x52A3, 0x52A3,
+	0x52A8, 0x52A8,
+	0x52B2, 0x52B3,
+	0x52FE, 0x52FE,
+	0x5305, 0x5305,
+	0x5316, 0x5316,
+	0x5319, 0x5319,
+	0x5320, 0x5320,
+	0x5339, 0x533A,
+	0x5341, 0x5341,
+	0x5343, 0x5343,
+	0x5347, 0x5347,
+	0x534A, 0x534A,
+	0x5355, 0x5355,
+	0x5360, 0x5361,
+	0x5370, 0x5370,
+	0x5373, 0x5374,
+	0x5378, 0x5378,
+	0x538B, 0x538B,
+	0x539F, 0x539F,
+	0x53BB, 0x53BB,
+	0x53C2, 0x53C2,
+	0x53C8, 0x53C8,
+	0x53CA, 0x53CA,
+	0x53CD, 0x53CD,
+	0x53D1, 0x53D1,
+	0x53D6, 0x53D8,
+	0x53E0, 0x53E0,
+	0x53E3, 0x53E3,
+	0x53E5, 0x53E6,
+	0x53EA, 0x53EB,
+	0x53EF, 0x53F0,
+	0x53F3, 0x53F3,
+	0x53F7, 0x53F7,
+	0x5403, 0x5404,
+	0x5408, 0x5408,
+	0x540C, 0x540E,
+	0x5411, 0x5411,
+	0x541E, 0x541E,
+	0x5426, 0x5426,
+	0x542B, 0x542B,
+	0x5435, 0x5435,
+	0x5458, 0x5458,
+	0x547D, 0x547D,
+	0x548C, 0x548C,
+	0x54C1, 0x54C1,
+	0x54CD, 0x54CD,
+	0x54EA, 0x54EA,
+	0x552F, 0x552F,
+	0x5582, 0x5582,
+	0x5668, 0x5668,
+	0x56DB, 0x56DB,
+	0x56DE, 0x56DE,
+	0x56E0, 0x56E0,
+	0x56F4, 0x56F4,
+	0x56FA, 0x56FA,
+	0x56FE, 0x56FE,
+	0x5706, 0x5706,
+	0x5708, 0x5708,
+	0x5728, 0x5728,
+	0x5730, 0x5730,
+	0x573A, 0x573A,
+	0x573E, 0x573E,
+	0x5740, 0x5740,
+	0x574F, 0x5750,
+	0x5757, 0x5757,
+	0x5783, 0x5783,
+	0x578B, 0x578B,
+	0x57CE, 0x57CE,
+	0x57DF, 0x57DF,
+	0x57FA, 0x57FA,
+	0x5806, 0x5806,
+	0x585E, 0x585E,
+	0x586B, 0x586B,
+	0x589E, 0x589E,
+	0x5904, 0x5904,
+	0x5907, 0x5907,
+	0x590D, 0x590D,
+	0x5916, 0x5916,
+	0x591A, 0x591A,
+	0x591F, 0x591F,
+	0x5927, 0x5927,
+	0x5929, 0x592A,
+	0x5931, 0x5931,
+	0x5934, 0x5934,
+	0x5957, 0x5957,
+	0x597D, 0x597D,
+	0x5982, 0x5982,
+	0x59CB, 0x59CB,
+	0x5B50, 0x5B50,
+	0x5B54, 0x5B54,
+	0x5B57, 0x5B58,
+	0x5B81, 0x5B81,
+	0x5B83, 0x5B83,
+	0x5B89, 0x5B89,
+	0x5B8B, 0x5B8C,
+	0x5B98, 0x5B98,
+	0x5B9A, 0x5B9A,
+	0x5B9C, 0x5B9E,
+	0x5BA2, 0x5BA2,
+	0x5BB9, 0x5BB9,
+	0x5BBD, 0x5BBD,
+	0x5BBF, 0x5BBF,
+	0x5BC6, 0x5BC6,
+	0x5BDF, 0x5BDF,
+	0x5BF9, 0x5BF9,
+	0x5BFC, 0x5BFC,
+	0x5C04, 0x5C04,
+	0x5C0F, 0x5C0F,
+	0x5C11, 0x5C11,
+	0x5C14, 0x5C14,
+	0x5C31, 0x5C31,
+	0x5C3E, 0x5C3E,
+	0x5C40, 0x5C40,
+	0x5C42, 0x5C42,
+	0x5C4F, 0x5C4F,
+	0x5D29, 0x5D29,
+	0x5DE5, 0x5DE6,
+	0x5DEE, 0x5DEE,
+	0x5DF1, 0x5DF2,
+	0x5E03, 0x5E03,
+	0x5E26, 0x5E27,
+	0x5E38, 0x5E38,
+	0x5E45, 0x5E45,
+	0x5E55, 0x5E55,
+	0x5E72, 0x5E73,
+	0x5E76, 0x5E76,
+	0x5E7D, 0x5E7D,
+	0x5E8F, 0x5E8F,
+	0x5E93, 0x5E95,
+	0x5EA6, 0x5EA6,
+	0x5ED3, 0x5ED3,
+	0x5EFA, 0x5EFA,
+	0x5F00, 0x5F00,
+	0x5F02, 0x5F04,
+	0x5F0F, 0x5F0F,
+	0x5F15, 0x5F15,
+	0x5F20, 0x5F20,
+	0x5F39, 0x5F3A,
+	0x5F52, 0x5F53,
+	0x5F55, 0x5F55,
+	0x5F62, 0x5F62,
+	0x5F71, 0x5F71,
+	0x5F79, 0x5F79,
+	0x5F7B, 0x5F7B,
+	0x5F80, 0x5F80,
+	0x5F84, 0x5F85,
+	0x5F88, 0x5F88,
+	0x5F8B, 0x5F8B,
+	0x5F97, 0x5F97,
+	0x5FAE, 0x5FAE,
+	0x5FC3, 0x5FC3,
+	0x5FC5, 0x5FC5,
+	0x5FD7, 0x5FD7,
+	0x5FEB, 0x5FEB,
+	0x6001, 0x6001,
+	0x600E, 0x600E,
+	0x6027, 0x6027,
+	0x602A, 0x602A,
+	0x603B, 0x603B,
+	0x6052, 0x6052,
+	0x6062, 0x6062,
+	0x606F, 0x606F,
+	0x60AC, 0x60AC,
+	0x60C5, 0x60C5,
+	0x60F3, 0x60F3,
+	0x610F, 0x610F,
+	0x611F, 0x611F,
+	0x61C2, 0x61C2,
+	0x620F, 0x6211,
+	0x6216, 0x6216,
+	0x622A, 0x622A,
+	0x6237, 0x6237,
+	0x6240, 0x6240,
+	0x6247, 0x6247,
+	0x624B, 0x624B,
+	0x624D, 0x624D,
+	0x6253, 0x6253,
+	0x6267, 0x6267,
+	0x626B, 0x626B,
+	0x6279, 0x6279,
+	0x627F, 0x627F,
+	0x6284, 0x6284,
+	0x628A, 0x628A,
+	0x6293, 0x6293,
+	0x6297, 0x6298,
+	0x629B, 0x629B,
+	0x62A2, 0x62A2,
+	0x62A4, 0x62A5,
+	0x62AC, 0x62AC,
+	0x62C9, 0x62C9,
+	0x62D2, 0x62D2,
+	0x62D6, 0x62D6,
+	0x62DF, 0x62DF,
+	0x62E5, 0x62E5,
+	0x62EC, 0x62EC,
+	0x62F7, 0x62F7,
+	0x62FC, 0x62FC,
+	0x62FF, 0x62FF,
+	0x6301, 0x6302,
+	0x6307, 0x6307,
+	0x6309, 0x6309,
+	0x6311, 0x6311,
+	0x6321, 0x6321,
+	0x632A, 0x632A,
+	0x6361, 0x6362,
+	0x636E, 0x636E,
+	0x6389, 0x6389,
+	0x6392, 0x6392,
+	0x63A2, 0x63A2,
+	0x63A5, 0x63A5,
+	0x63A7, 0x63A9,
+	0x63CF, 0x63D0,
+	0x63D2, 0x63D2,
+	0x641E, 0x641E,
+	0x642C, 0x642C,
+	0x6444, 0x6444,
+	0x6446, 0x6446,
+	0x6458, 0x6458,
+	0x64CD, 0x64CE,
+	0x6512, 0x6512,
+	0x652F, 0x652F,
+	0x6536, 0x6536,
+	0x6539, 0x6539,
+	0x653E, 0x653E,
+	0x6545, 0x6545,
+	0x6548, 0x6548,
+	0x6559, 0x6559,
+	0x6563, 0x6563,
+	0x6570, 0x6570,
+	0x6574, 0x6574,
+	0x6587, 0x6587,
+	0x659C, 0x659C,
+	0x65AD, 0x65AD,
+	0x65B0, 0x65B0,
+	0x65B9, 0x65B9,
+	0x65E0, 0x65E0,
+	0x65E2, 0x65E2,
+	0x65E5, 0x65E7,
+	0x65E9, 0x65E9,
+	0x65F6, 0x65F6,
+	0x660E, 0x660E,
+	0x6613, 0x6613,
+	0x661F, 0x661F,
+	0x662F, 0x662F,
+	0x663E, 0x663E,
+	0x665A, 0x665A,
+	0x666E, 0x666F,
+	0x6696, 0x6697,
+	0x66F4, 0x66F4,
+	0x66FF, 0x6700,
+	0x6709, 0x6709,
+	0x670D, 0x670D,
+	0x671F, 0x671F,
+	0x672A, 0x672C,
+	0x673A, 0x673A,
+	0x6740, 0x6740,
+	0x675F, 0x675F,
+	0x6761, 0x6761,
+	0x6765, 0x6765,
+	0x677E, 0x677F,
+	0x6781, 0x6781,
+	0x6784, 0x6784,
+	0x6790, 0x6790,
+	0x679A, 0x679A,
+	0x679C, 0x679C,
+	0x67C4, 0x67C4,
+	0x67D0, 0x67D0,
+	0x67D3, 0x67D3,
+	0x67E5, 0x67E5,
+	0x6807, 0x6808,
+	0x680F, 0x680F,
+	0x6821, 0x6821,
+	0x6837, 0x6839,
+	0x683C, 0x683C,
+	0x6846, 0x6846,
+	0x6848, 0x6848,
+	0x6863, 0x6863,
+	0x6869, 0x6869,
+	0x68C0, 0x68C0,
+	0x68D5, 0x68D5,
+	0x6954, 0x6954,
+	0x695A, 0x695A,
+	0x6982, 0x6982,
+	0x6984, 0x6984,
+	0x69DB, 0x69DB,
+	0x69FD, 0x69FD,
+	0x6A21, 0x6A21,
+	0x6A2A, 0x6A2A,
+	0x6A44, 0x6A44,
+	0x6A59, 0x6A59,
+	0x6B21, 0x6B21,
+	0x6B3E, 0x6B3E,
+	0x6B62, 0x6B65,
+	0x6B7B, 0x6B7B,
+	0x6B8B, 0x6B8B,
+	0x6BB5, 0x6BB5,
+	0x6BCF, 0x6BCF,
+	0x6BD4, 0x6BD4,
+	0x6BDB, 0x6BDB,
+	0x6BEB, 0x6BEB,
+	0x6C38, 0x6C38,
+	0x6C42, 0x6C42,
+	0x6C47, 0x6C47,
+	0x6C49, 0x6C49,
+	0x6C61, 0x6C61,
+	0x6CA1, 0x6CA1,
+	0x6CBB, 0x6CBB,
+	0x6CBF, 0x6CBF,
+	0x6CD5, 0x6CD5,
+	0x6CE8, 0x6CE8,
+	0x6CF5, 0x6CF5,
+	0x6D3B, 0x6D3B,
+	0x6D41, 0x6D41,
+	0x6D4B, 0x6D4B,
+	0x6D88, 0x6D88,
+	0x6DA8, 0x6DA8,
+	0x6DE1, 0x6DE1,
+	0x6DF1, 0x6DF1,
+	0x6DF7, 0x6DF7,
+	0x6DF9, 0x6DF9,
+	0x6DFB, 0x6DFB,
+	0x6E05, 0x6E05,
+	0x6E10, 0x6E10,
+	0x6E21, 0x6E21,
+	0x6E32, 0x6E32,
+	0x6E38, 0x6E38,
+	0x6E83, 0x6E83,
+	0x6E90, 0x6E90,
+	0x6ED1, 0x6ED1,
+	0x6EDA, 0x6EDA,
+	0x6EE1, 0x6EE1,
+	0x6EE4, 0x6EE4,
+	0x6F02, 0x6F02,
+	0x6F0F, 0x6F0F,
+	0x7070, 0x7070,
+	0x7075, 0x7075,
+	0x70AE, 0x70AE,
+	0x70B8, 0x70B9,
+	0x70D8, 0x70D8,
+	0x70ED, 0x70ED,
+	0x7119, 0x7119,
+	0x7126, 0x7126,
+	0x7136, 0x7136,
+	0x7167, 0x7167,
+	0x7206, 0x7206,
+	0x7247, 0x7248,
+	0x7269, 0x7269,
+	0x72B6, 0x72B6,
+	0x72EC, 0x72EC,
+	0x731C, 0x731C,
+	0x7387, 0x7387,
+	0x73AF, 0x73B0,
+	0x73E0, 0x73E0,
+	0x7406, 0x7406,
+	0x74F6, 0x74F6,
+	0x751F, 0x751F,
+	0x7528, 0x7528,
+	0x7531, 0x7531,
+	0x7533, 0x7533,
+	0x753B, 0x753B,
+	0x754C, 0x754C,
+	0x7559, 0x7559,
+	0x7565, 0x7565,
+	0x75C7, 0x75C7,
+	0x75D5, 0x75D5,
+	0x767B, 0x767B,
+	0x767D, 0x767E,
+	0x7684, 0x7684,
+	0x76D1, 0x76D1,
+	0x76D6, 0x76D6,
+	0x76D8, 0x76D8,
+	0x76EE, 0x76EE,
+	0x76F2, 0x76F2,
+	0x76F4, 0x76F4,
+	0x76F8, 0x76F8,
+	0x7701, 0x7701,
+	0x770B, 0x770B,
+	0x771F, 0x771F,
+	0x773C, 0x773C,
+	0x7740, 0x7740,
+	0x775B, 0x775B,
+	0x778E, 0x778E,
+	0x77E5, 0x77E5,
+	0x77E9, 0x77E9,
+	0x7801, 0x7801,
+	0x7834, 0x7834,
+	0x7840, 0x7840,
+	0x786C, 0x786C,
+	0x786E, 0x786E,
+	0x78B0, 0x78B0,
+	0x793A, 0x793A,
+	0x79BB, 0x79BB,
+	0x79C1, 0x79C1,
+	0x79CD, 0x79CD,
+	0x79D2, 0x79D2,
+	0x79EF, 0x79EF,
+	0x79FB, 0x79FB,
+	0x7A00, 0x7A00,
+	0x7A0B, 0x7A0B,
+	0x7A0D, 0x7A0D,
+	0x7A33, 0x7A33,
+	0x7A3F, 0x7A3F,
+	0x7A7A, 0x7A7A,
+	0x7A81, 0x7A81,
+	0x7A97, 0x7A97,
+	0x7A9C, 0x7A9C,
+	0x7ACB, 0x7ACB,
+	0x7AEF, 0x7AEF,
+	0x7B14, 0x7B14,
+	0x7B26, 0x7B26,
+	0x7B2C, 0x7B2C,
+	0x7B49, 0x7B49,
+	0x7B80, 0x7B80,
+	0x7B97, 0x7B97,
+	0x7BA1, 0x7BA1,
+	0x7C07, 0x7C07,
+	0x7C7B, 0x7C7B,
+	0x7C97, 0x7C97,
+	0x7CBE, 0x7CBE,
+	0x7CFB, 0x7CFB,
+	0x7D20, 0x7D20,
+	0x7D22, 0x7D22,
+	0x7D27, 0x7D27,
+	0x7D2B, 0x7D2B,
+	0x7D2F, 0x7D2F,
+	0x7E41, 0x7E41,
+	0x7EA2, 0x7EA2,
+	0x7EA6, 0x7EA7,
+	0x7EAF, 0x7EAF,
+	0x7EB9, 0x7EB9,
+	0x7EBF, 0x7EBF,
+	0x7EC4, 0x7EC4,
+	0x7EC6, 0x7EC6,
+	0x7EC8, 0x7EC8,
+	0x7ECF, 0x7ECF,
+	0x7ED1, 0x7ED1,
+	0x7ED3, 0x7ED3,
+	0x7ED5, 0x7ED5,
+	0x7ED8, 0x7ED9,
+	0x7EDD, 0x7EDD,
+	0x7EDF, 0x7EDF,
+	0x7EE7, 0x7EE7,
+	0x7EEA, 0x7EEA,
+	0x7EF4, 0x7EF4,
+	0x7EFF, 0x7F00,
+	0x7F13, 0x7F13,
+	0x7F16, 0x7F16,
+	0x7F18, 0x7F18,
+	0x7F1D, 0x7F1D,
+	0x7F29, 0x7F29,
+	0x7F3A, 0x7F3A,
+	0x7F51, 0x7F51,
+	0x7F69, 0x7F69,
+	0x7F6E, 0x7F6E,
+	0x7F8E, 0x7F8E,
+	0x7FFB, 0x7FFB,
+	0x8001, 0x8001,
+	0x8003, 0x8003,
+	0x8005, 0x8005,
+	0x800C, 0x800C,
+	0x80CC, 0x80CC,
+	0x80CE, 0x80CE,
+	0x80D6, 0x80D6,
+	0x80DC, 0x80DC,
+	0x80FD, 0x80FD,
+	0x817E, 0x817E,
+	0x81C2, 0x81C2,
+	0x81EA, 0x81EA,
+	0x81F3, 0x81F4,
+	0x8272, 0x8272,
+	0x8282, 0x8282,
+	0x82B1, 0x82B1,
+	0x82E5, 0x82E5,
+	0x82F1, 0x82F1,
+	0x8303, 0x8303,
+	0x83DC, 0x83DC,
+	0x843D, 0x843D,
+	0x84DD, 0x84DD,
+	0x85CF, 0x85CF,
+	0x865A, 0x865A,
+	0x884C, 0x884C,
+	0x8865, 0x8865,
+	0x8868, 0x8868,
+	0x88AB, 0x88AB,
+	0x88C5, 0x88C5,
+	0x88F9, 0x88F9,
+	0x897F, 0x897F,
+	0x8981, 0x8981,
+	0x8986, 0x8986,
+	0x89C1, 0x89C2,
+	0x89C4, 0x89C4,
+	0x89C6, 0x89C6,
+	0x89D2, 0x89D2,
+	0x89E3, 0x89E3,
+	0x89E6, 0x89E6,
+	0x8BA1, 0x8BA1,
+	0x8BA4, 0x8BA4,
+	0x8BA9, 0x8BA9,
+	0x8BAD, 0x8BAD,
+	0x8BB0, 0x8BB0,
+	0x8BB2, 0x8BB2,
+	0x8BB8, 0x8BB8,
+	0x8BBA, 0x8BBA,
+	0x8BBE, 0x8BBF,
+	0x8BC1, 0x8BC1,
+	0x8BCA, 0x8BCA,
+	0x8BCD, 0x8BCD,
+	0x8BD1, 0x8BD1,
+	0x8BD5, 0x8BD5,
+	0x8BDD, 0x8BDD,
+	0x8BE5, 0x8BE6,
+	0x8BEF, 0x8BEF,
+	0x8BF4, 0x8BF4,
+	0x8BF7, 0x8BF7,
+	0x8BFB, 0x8BFB,
+	0x8C01, 0x8C01,
+	0x8C03, 0x8C03,
+	0x8C31, 0x8C31,
+	0x8C37, 0x8C37,
+	0x8C61, 0x8C61,
+	0x8D1D, 0x8D1D,
+	0x8D25, 0x8D26,
+	0x8D28, 0x8D28,
+	0x8D34, 0x8D35,
+	0x8D39, 0x8D39,
+	0x8D44, 0x8D44,
+	0x8D70, 0x8D70,
+	0x8D76, 0x8D77,
+	0x8D85, 0x8D85,
+	0x8D8A, 0x8D8A,
+	0x8DB3, 0x8DB3,
+	0x8DD1, 0x8DD1,
+	0x8DDF, 0x8DDF,
+	0x8DE8, 0x8DE8,
+	0x8DEF, 0x8DEF,
+	0x8DF3, 0x8DF3,
+	0x8E29, 0x8E29,
+	0x8EAB, 0x8EAB,
+	0x8F66, 0x8F66,
+	0x8F6C, 0x8F6C,
+	0x8F6E, 0x8F6F,
+	0x8F7B, 0x8F7B,
+	0x8F7D, 0x8F7D,
+	0x8F83, 0x8F83,
+	0x8F93, 0x8F93,
+	0x8FA8, 0x8FA8,
+	0x8FB9, 0x8FB9,
+	0x8FBE, 0x8FBE,
+	0x8FC7, 0x8FC7,
+	0x8FD0, 0x8FD1,
+	0x8FD4, 0x8FD4,
+	0x8FD8, 0x8FD9,
+	0x8FDB, 0x8FDE,
+	0x8FF0, 0x8FF0,
+	0x9000, 0x9000,
+	0x9006, 0x9006,
+	0x9009, 0x9009,
+	0x900F, 0x9010,
+	0x901A, 0x901A,
+	0x9020, 0x9020,
+	0x9038, 0x9038,
+	0x904D, 0x904D,
+	0x9053, 0x9053,
+	0x907F, 0x907F,
+	0x90A3, 0x90A3,
+	0x90BB, 0x90BB,
+	0x90E8, 0x90E8,
+	0x90FD, 0x90FD,
+	0x914D, 0x914D,
+	0x91C7, 0x91C7,
+	0x91CA, 0x91CA,
+	0x91CC, 0x91CD,
+	0x91CF, 0x91CF,
+	0x91D1, 0x91D1,
+	0x9488, 0x9489,
+	0x94A5, 0x94A5,
+	0x94A9, 0x94A9,
+	0x94AE, 0x94AE,
+	0x94B3, 0x94B3,
+	0x94FA, 0x94FA,
+	0x94FE, 0x94FE,
+	0x9500, 0x9501,
+	0x9519, 0x9519,
+	0x9524, 0x9524,
+	0x9526, 0x9526,
+	0x952E, 0x952F,
+	0x955C, 0x955C,
+	0x957F, 0x957F,
+	0x95E8, 0x95E8,
+	0x95EA, 0x95EA,
+	0x95ED, 0x95EE,
+	0x95F2, 0x95F2,
+	0x95F4, 0x95F4,
+	0x95F8, 0x95F8,
+	0x961F, 0x961F,
+	0x9632, 0x9632,
+	0x9636, 0x9636,
+	0x963B, 0x963B,
+	0x963F, 0x963F,
+	0x9645, 0x9645,
+	0x9650, 0x9650,
+	0x9664, 0x9664,
+	0x9669, 0x9669,
+	0x968F, 0x9690,
+	0x96C5, 0x96C6,
+	0x96F6, 0x96F7,
+	0x9700, 0x9700,
+	0x9752, 0x9752,
+	0x9759, 0x9759,
+	0x975E, 0x975E,
+	0x9760, 0x9760,
+	0x9762, 0x9762,
+	0x9875, 0x9876,
+	0x9879, 0x987B,
+	0x9884, 0x9884,
+	0x9888, 0x9888,
+	0x9891, 0x9891,
+	0x9897, 0x9898,
+	0x989C, 0x989D,
+	0x98CE, 0x98CE,
+	0x98D8, 0x98D8,
+	0x9988, 0x9988,
+	0x9A6C, 0x9A6C,
+	0x9A7B, 0x9A7B,
+	0x9A8C, 0x9A8C,
+	0x9AD8, 0x9AD8,
+	0x9B54, 0x9B54,
+	0x9EC4, 0x9EC4,
+	0x9ED1, 0x9ED1,
+	0x9ED8, 0x9ED8,
+	0x9F13, 0x9F13,
+	0x9F20, 0x9F20,
+	0x9F50, 0x9F50,
+	0x9F7F, 0x9F7F,
+	0xFE0F, 0xFE0F,
+	0xFF00, 0xFFEF,
+	0
+};
+
 auto TryBuildOwnFontDx12(void* rendererUserData) noexcept -> ImFont* {
 	// imgui_impl_dx12 私有数据布局（1.88~1.91 稳定）：
 	//   [0]=ID3D12Device*  [1]=ID3D12GraphicsCommandList*  [2]=RTV堆  [3]=SRV堆
@@ -5512,15 +6712,6 @@ auto TryBuildOwnFontDx12(void* rendererUserData) noexcept -> ImFont* {
 	}
 
 	// ① 图集：常用汉字 + ASCII + 全角/标点区，一处不落（面板文案全在这几个区里）。
-	static const ImWchar kRanges[] {
-		0x0020, 0x00FF,   // ASCII + 拉丁补充
-		0x2010, 0x2027,   // 破折号 / 省略号
-		0x2460, 0x24FF,   // 带圈数字
-		0x3000, 0x30FF,   // CJK 标点
-		0x4E00, 0x9FFF,   // 常用汉字
-		0xFF00, 0xFFEF,   // 全角形式
-		0
-	};
 	static const char* const kFontFiles[] {
 		"msyh.ttc", "msyhl.ttc", "msyhbd.ttc",   // 微软雅黑
 		"simhei.ttf", "simsun.ttc", "Deng.ttf",  // 黑体 / 宋体 / 等线
@@ -5532,7 +6723,7 @@ auto TryBuildOwnFontDx12(void* rendererUserData) noexcept -> ImFont* {
 		}
 		char path[MAX_PATH] {};
 		std::snprintf(path, sizeof(path), "C:\\Windows\\Fonts\\%s", name);
-		loaded = g_ownAtlas.AddFontFromFileTTF(path, 18.0f, nullptr, kRanges);
+		loaded = g_ownAtlas.AddFontFromFileTTF(path, 18.0f, nullptr, kPanelGlyphRanges);
 		if (loaded != nullptr) {
 			char line[200] {};
 			std::snprintf(line, sizeof(line), "Own font: loaded %s", name);
@@ -5761,15 +6952,6 @@ auto TryAddEarlyFont(ImGuiContext* c) noexcept -> void {
 		return;
 	}
 	__try {
-		static const ImWchar kRanges[] {
-			0x0020, 0x00FF,   // ASCII + 拉丁补充
-			0x2010, 0x2027,   // 破折号 / 省略号
-			0x2460, 0x24FF,   // 带圈数字
-			0x3000, 0x30FF,   // CJK 标点
-			0x4E00, 0x9FFF,   // 常用汉字
-			0xFF00, 0xFFEF,   // 全角形式
-			0
-		};
 		static const char* const kFontFiles[] {
 			"msyh.ttc", "msyhl.ttc", "msyhbd.ttc",   // 微软雅黑
 			"simhei.ttf", "simsun.ttc", "Deng.ttf",  // 黑体 / 宋体 / 等线
@@ -5777,7 +6959,7 @@ auto TryAddEarlyFont(ImGuiContext* c) noexcept -> void {
 		for (const char* name : kFontFiles) {
 			char path[MAX_PATH] {};
 			std::snprintf(path, sizeof(path), "C:\\Windows\\Fonts\\%s", name);
-			ImFont* f = c->IO.Fonts->AddFontFromFileTTF(path, 18.0f, nullptr, kRanges);
+			ImFont* f = c->IO.Fonts->AddFontFromFileTTF(path, 18.0f, nullptr, kPanelGlyphRanges);
 			if (f != nullptr) {
 				g_earlyFont = f;
 				char line[200] {};
@@ -6229,56 +7411,96 @@ auto StarRampColour(ImU32 col, float t) noexcept -> ImU32 {
 
 // ★ v0.15.0：暗黑3 风格的立体星（用户给的参考图：D3 地图上的金色任务星）。
 //   ★ v0.15.2 按用户反馈定稿：**几何回到 v0.15.0 的胖乎乎样子**（内谷 0.50R + 边缘外鼓 10%），
-//     色带保留 v0.15.1 的"深橙棕→亮黄"（单纯变暗会发绿）与 20 层平滑渐变。
-//   ② 色带从"乘系数变暗"改成 StarRampColour（深端往橙棕走，不然黄色会变橄榄绿）；
-//   ③ 层数 10→20、每层缩 4.2%（一圈圈的台阶感肉眼基本消失）。
-//   保留：轮廓细分、分层渐变、最外圈深色描边。颜色全部基于用户给每一类选的 rgb_xxx。
+//     色带保留 v0.15.1 的"深橙棕→亮黄"（单纯变暗会发绿）。
+// ★ v0.18.11：**整颗星重写成"顶点色渐变网格"** —— 修"星星一多帧数砍半"（2026-09-25 实测）。
+//   旧画法 = 20 层 × 80 点凹多边形填充：每星 1600+ 顶点，而且 ImGui 的凹多边形填充
+//   内部要做 O(n²) 剖分 ⇒ 一颗星十几万次运算，几百颗星 = 每帧几千万次，CPU 直接打满。
+//   新画法 = 三圈顶点（中心亮 / 0.55R 中间 / 1.0R 深边）+ 一次手写三角网格，
+//   顶点色在三角形内线性插值 ⇒ 渐变依旧平滑，**41 顶点 / 1 次网格写入，约 40 倍省**。
+//   几何仍是胖乎乎（外鼓 10% 保留在轮廓点里，两圈同缩放，形状不变）。
 auto DrawStarShapeD3(ImDrawList* dl, float cx, float cy, float radius, ImU32 col,
                      ImU32 outlineCol, float outlineW) noexcept -> void {
-	ImVec2 v[10];
+	constexpr int   kSeg = 2;                 // 轮廓每边 2 段：保留"圆臂"观感，点数可控
+	constexpr int   kPts = 10 * kSeg;         // 20 点平滑轮廓
+	constexpr float kPi  = 3.14159265f;
+
+	// ① 基础星形 10 点（5 外角 R + 5 内谷 0.50R）——与旧版完全同角度。
+	ImVec2 base[10];
 	for (int k = 0; k < 5; ++k) {
 		const float ao = -1.5707963f + static_cast<float>(k) * 1.2566371f;
 		const float ai = ao + 0.6283185f;
-		v[k * 2]     = ImVec2(cx + radius * std::cos(ao), cy + radius * std::sin(ao));
-		v[k * 2 + 1] = ImVec2(cx + radius * 0.50f * std::cos(ai), cy + radius * 0.50f * std::sin(ai));
+		base[k * 2]     = ImVec2(cx + radius * std::cos(ao), cy + radius * std::sin(ao));
+		base[k * 2 + 1] = ImVec2(cx + radius * 0.50f * std::cos(ai), cy + radius * 0.50f * std::sin(ai));
 	}
-	constexpr int   kSeg    = 8;
-	constexpr int   kPts    = 10 * kSeg;
-	constexpr int   kLayers = 20;
-	constexpr float kPi     = 3.14159265f;
+	// ② 平滑轮廓（每边外鼓 10%，胖乎乎的圆臂）——同时用作"剪影"和"最外圈"。
 	ImVec2 pts[kPts];
 	{
 		int n = 0;
 		for (int i = 0; i < 10; ++i) {
-			const ImVec2& a = v[i];
-			const ImVec2& b = v[(i + 1) % 10];
+			const ImVec2& a = base[i];
+			const ImVec2& b = base[(i + 1) % 10];
 			for (int s = 0; s < kSeg; ++s) {
 				const float t = static_cast<float>(s) / static_cast<float>(kSeg);
 				float px = a.x + (b.x - a.x) * t;
 				float py = a.y + (b.y - a.y) * t;
-				const float dx = px - cx;
-				const float dy = py - cy;
-				const float d  = std::sqrt(dx * dx + dy * dy);
+				const float ddx = px - cx;
+				const float ddy = py - cy;
+				const float d  = std::sqrt(ddx * ddx + ddy * ddy);
 				if (d > 0.0001f) {
-					const float k = 1.0f + 0.10f * std::sin(kPi * t);   // 外鼓 10%：胖乎乎的圆臂（v0.15.0 的样子）
-					px = cx + dx * k;
-					py = cy + dy * k;
+					const float k = 1.0f + 0.10f * std::sin(kPi * t);
+					px = cx + ddx * k;
+					py = cy + ddy * k;
 				}
 				pts[n] = ImVec2(px, py);
 				++n;
 			}
 		}
 	}
-	for (int L = 0; L < kLayers; ++L) {
-		const float scale = 1.0f - 0.042f * static_cast<float>(L);   // 20 层、每层缩 4.2%：台阶感肉眼基本看不见
-		ImVec2 lp[kPts];
-		for (int i = 0; i < kPts; ++i) {
-			lp[i].x = cx + (pts[i].x - cx) * scale;
-			lp[i].y = cy + (pts[i].y - cy) * scale;
-		}
-		dl->AddConcavePolyFilled(lp, kPts,
-			StarRampColour(col, static_cast<float>(L) / static_cast<float>(kLayers - 1)));
+	const ImU32 cRim  = StarRampColour(col, 0.00f);
+	const ImU32 cMid  = StarRampColour(col, 0.55f);
+	const ImU32 cCore = StarRampColour(col, 1.00f);
+
+	// ③ 剪影：一次 20 点凹多边形填充（带抗锯齿）铺在最底层 ——
+	//    它给整颗星的外缘抗锯齿（网格的斜边是不带 AA 的，靠这层盖毛边）。
+	dl->AddConcavePolyFilled(pts, kPts, cRim);
+
+	// ④ 渐变网格：v0 = 中心(亮)；v1..20 = 中圈(0.55 倍，过渡色)；v21..40 = 外圈(深)。
+	//    中心扇 20 三角 + 环带 20 四边形(40 三角) = 180 索引 / 41 顶点。
+	//
+	//  ★★ v0.18.12 修（用户截图：星上多出一个大棕楔子、描边整条错位）：
+	//     ImDrawIdx 里存的是**整条 draw list 的绝对顶点号**，不是"本块的相对号"。
+	//     v0.18.11 直接手写 vtx[]/idx[] 时，索引写成 0..40（相对号）⇒ 这 41 个索引
+	//     指的是**这条 draw list 最前面那 41 个顶点**（也就是本星自己那层抗锯齿剪影
+	//     的顶点），于是渐变网格被画成"从一个轮廓点拉出去的乱扇面" = 那个大楔子；
+	//     同时 _VtxCurrentIdx 没跟着涨 41 ⇒ 后面每一笔（本星的描边、下一颗星、
+	//     面板）都指回我们这 41 个顶点 ⇒ 描边也整条错位。
+	//     ⇒ 现在改用 ImGui 自己的 PrimWriteVtx / PrimWriteIdx：
+	//       · 索引显式加上 vtxBase（绝对顶点号）；
+	//       · PrimWriteVtx 自动推进 _VtxCurrentIdx，也自动处理 64K 顶点的 VtxOffset 分块。
+	//     教训：凡是绕过 ImGui 手写 ImDrawVert/ImDrawIdx，绝对号与 _VtxCurrentIdx
+	//     这两件事必须自己接上；否则**画出来的东西对不上，而且会污染同列表里后面所有的笔**。
+	dl->PrimReserve(180, 41);
+	const ImDrawIdx vtxBase = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+	const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+	dl->PrimWriteVtx(ImVec2(cx, cy), uv, cCore);
+	for (int i = 0; i < kPts; ++i) {
+		dl->PrimWriteVtx(ImVec2(cx + (pts[i].x - cx) * 0.55f, cy + (pts[i].y - cy) * 0.55f), uv, cMid);
 	}
+	for (int i = 0; i < kPts; ++i) {
+		dl->PrimWriteVtx(pts[i], uv, cRim);
+	}
+	for (int i = 0; i < kPts; ++i) {
+		const int j = (i + 1) % kPts;
+		const ImDrawIdx a = static_cast<ImDrawIdx>(vtxBase + 1 + i);
+		const ImDrawIdx b = static_cast<ImDrawIdx>(vtxBase + 1 + j);
+		const ImDrawIdx c = static_cast<ImDrawIdx>(vtxBase + 21 + i);
+		const ImDrawIdx d = static_cast<ImDrawIdx>(vtxBase + 21 + j);
+		dl->PrimWriteIdx(vtxBase);                                                  // 中心扇
+		dl->PrimWriteIdx(a); dl->PrimWriteIdx(b);
+		dl->PrimWriteIdx(a); dl->PrimWriteIdx(c); dl->PrimWriteIdx(d);               // 环带（2 三角）
+		dl->PrimWriteIdx(a); dl->PrimWriteIdx(d); dl->PrimWriteIdx(b);
+	}
+	// ⑤ 描边（可选）：同一条 20 点轮廓，便宜且顺眼。
 	if (outlineW > 0.0f && (outlineCol & 0xFF000000u) != 0u) {
 		dl->AddPolyline(pts, kPts, outlineCol, ImDrawFlags_Closed, outlineW);
 	}
@@ -6358,12 +7580,29 @@ auto ReadCameraOffset(const void* obj, float zoom, float& offX, float& offY) noe
 //    · 引擎偶尔几秒不报 → 快照按 star_persist_sec 先留着，超时才清空（不闪）；
 //    · 画的时候每帧用**当帧**相机现算屏幕位置 ⇒ 不会错位。
 //  一句话：星表永远只镜像“引擎最后一次报的那几件”，绝不自己长出新条目。
-auto DrawStars(ImGuiContext* c) noexcept -> void {
+auto DrawStarsInner(ImGuiContext* c) noexcept -> void {
+	// ★ v0.18.11：每帧只干一次活的保险 —— 日志显示宿主会把回调叫到超出帧率
+	//   （"Overlay stars" 行数远超帧数推算），多叫一次就多画一整遍星、多做一遍去重。
+	static int s_lastStarFrame = -1;
+	if (c->FrameCount == s_lastStarFrame) {
+		return;
+	}
+	s_lastStarFrame = c->FrameCount;
+
+	// ★ v0.18.14：每帧把"可读地址缓存"清一次。
+	//   缓存是为了躲开 VirtualQuery（热路径上最大的开销，见 AddressReadableCached 注释）；
+	//   每帧清一次 = 过期窗口最多一帧，和"引擎结构体在一帧里不会搬家"这个既有假设一致。
+	//   真正读取处还有 SEH 兜底，所以缓存过期也不会崩。
+	AddressCacheReset();
+
 	const int n = g_starCount.load(std::memory_order_acquire);
 	g_starCount.store(0, std::memory_order_relaxed);
 
 	ImGui::SetCurrentContext(c);
 	ImDrawList* dl = ImGui::GetForegroundDrawList();
+	// ★ v0.18.13：剖面用 —— 画星前后这条 draw list 的命令数差 = 星新增了几个绘制命令。
+	//   （只有 38 颗星却新增了几十个命令，说明批处理被描边打断了，那是另一类问题。）
+	const int profCmd0 = (dl != nullptr) ? dl->CmdBuffer.Size : 0;
 	const float hw     = c->IO.DisplaySize.x * 0.5f;
 	const float hh     = c->IO.DisplaySize.y * 0.5f;
 	const float radius = g_settings.starSize;
@@ -6534,14 +7773,24 @@ auto DrawStars(ImGuiContext* c) noexcept -> void {
 	g_starsLive.store(drawn, std::memory_order_relaxed);
 	g_starsLiveSet.store(setDrawn, std::memory_order_relaxed);
 	g_starsLiveUnique.store(uniqueDrawn, std::memory_order_relaxed);
+	// ★ v0.18.13：剖面 —— 累计画出的星数 + 星给这条 draw list 新增的绘制命令数。
+	g_profStarDrawn.fetch_add(static_cast<std::uint64_t>(drawn), std::memory_order_relaxed);
+	if (dl != nullptr) {
+		g_profStarCmds.fetch_add(static_cast<std::uint64_t>(dl->CmdBuffer.Size - profCmd0),
+		                         std::memory_order_relaxed);
+	}
 
-	// 限流诊断（每 ~2 秒一行）。末尾几个括号是给“下一轮出问题”用的：
+	// 限流诊断（★ v0.18.11：改成按时间 ≥10 秒一条 —— 原来按帧数算，长会话积累起来
+	//   也是一天好几 MB；这条 400 字节，10 秒一条一天最多 3MB）。
 	//   o0 = 当帧第一个观测的坐标+槽位+可信度；h0 = 快照第一条的坐标+槽位；
 	//   age = 快照多久了（秒，-1 = 还没有快照）；d0 = 第一颗实际画出来的星的屏幕位置；
 	//   rad = d0 离屏幕中心多远（"星是不是贴在人物身上"就看它）。
 	//   drawn 应该永远 <= obs（或 <= 上一帧的 obs）。
-	static int s_diagTick = 0;
-	if ((s_diagTick++ % 120) == 0) {
+	//   ★ v0.18.16：间隔改成配置项 diag_sec（默认 60 秒，原来是硬编码 10 秒）。
+	static std::int64_t s_diagLastMs = 0;
+	// ★ v0.18.17：Overlay stars 行也是纯诊断，只在 verbose 打开时写。
+	if (g_settings.verbose && nowMs - s_diagLastMs >= static_cast<std::int64_t>(g_settings.diagSec) * 1000) {
+		s_diagLastMs = nowMs;
 		// ★ v0.14.5：把"这一帧报了几件、各自是什么槽位"一次列全。
 		//   症状"地上没有套装却多出一颗绿星"看 osl 就知道第二件被判成了什么。
 		char osl[48] {};
@@ -6591,6 +7840,15 @@ auto DrawStars(ImGuiContext* c) noexcept -> void {
 }
 
 
+// ★ v0.18.13：外层只做计时（帧数不在这里数 —— 见 g_profStarFrames 的说明：
+//   宿主会把回调叫得比帧率还密，数调用次数会把 fps 算高；真帧数用 FrameCount）。
+auto DrawStars(ImGuiContext* c) noexcept -> void {
+	const std::uint64_t t0 = __rdtsc();
+	DrawStarsInner(c);
+	g_profStarCycles.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	g_profStarFrames.fetch_add(1, std::memory_order_relaxed);   // 仅供参考：回调被调了几次
+}
+
 // SEH 包装：星标只是锦上添花，出任何异常都不影响面板和地图（也不会判死）。
 auto SafeStars(ImGuiContext* c) noexcept -> int {
 	__try {
@@ -6623,7 +7881,11 @@ auto SafeTick(ImGuiContext* c) noexcept -> int {
 		}
 		g_lastFrame = c->FrameCount;
 		ApplyMapZoom();   // ★ v0.12.8：雷达倍率（倍率=1 时这个函数什么都不做）
+		// ★ v0.18.13：剖面 —— 面板每帧画了多久（纯 POD 局部量，SEH 里安全）
+		const std::uint64_t profPanelT0 = __rdtsc();
 		DrawPanel(c);
+		g_profPanelCycles.fetch_add(__rdtsc() - profPanelT0, std::memory_order_relaxed);
+		g_profPanelFrames.fetch_add(1, std::memory_order_relaxed);
 		return 1;
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 		return -1;
@@ -7049,7 +8311,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 	g_context = context;
 
-	context->LogInfo("Loot Map 0.18.10 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
+	context->LogInfo("Loot Map 0.18.21 loading ... (the ImGui panel and the map stars are drawn inside an overlay layer: RuffnecKk MapSense, or the standalone d2rl-loot-map-standalone.dll when MapSense is absent; if neither is present it falls back to the legacy native panel and logs exactly why)");
 
 	// 1) 读配置
 	(void)context->EnsureConfig();
@@ -7065,7 +8327,12 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 
 	// 1b) SDK 探测的接线（服务扫描 + 生命周期监听），放在钩子之前：
 	//     即使取色钩子因游戏版本不匹配而失败，探测数据照样能拿到。
-	ProbeServiceScan(context, "load");
+	//  ★ v0.18.17：扫描本身只在 verbose 打开时跑 —— 纯诊断，一次启动要写约 12KB
+	//    （两遍 18 项服务清单 + 几十行数据表清单），正常玩家完全用不到。
+	//    手动触发：控制台 lootmap-probe。
+	if (g_settings.verbose) {
+		ProbeServiceScan(context, "load");
+	}
 	InstallProbeListeners(context);
 	context->RegisterConsoleCommand("lootmap-probe", ProbeCommand,
 		"Scan the plugin SDK services and dump ground-item fields into loot-map.log.");
@@ -7130,7 +8397,11 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	context->RegisterConsoleCommand("lootmap", TogglePanelCommand, "Open / close the Loot Map panel (same as the Controls hotkey).");
 	context->RegisterConsoleCommand("lootmap-status", StatusCommand, "Show the Loot Map status and all quality keys.");
 	context->RegisterConsoleCommand("lootmap-reload", ReloadCommand, "Re-read loot-map.toml from disk.");
-	context->RegisterConsoleCommand("lootmap-set", SetCommand, "lootmap-set <key> on|off | lootmap-set mode observe|color");
+	context->RegisterConsoleCommand("lootmap-set", SetCommand, "lootmap-set <key> on|off | lootmap-set mode observe|color.");
+
+	// 4b) ★ v0.18.13：在加载时就把 TSC 频率标定掉（内部忙等 ~5ms）。
+	//     不能等到第一次写 prof 行才标定 —— 那一下 5ms 会卡在游戏里变成一次可见的卡顿。
+	(void)ProfTscPerUs();
 
 	char summary[300] {};
 	std::snprintf(summary, sizeof(summary),
